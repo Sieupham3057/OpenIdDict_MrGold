@@ -6,6 +6,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AuthDemo.Api.Data;
 
+
 // Kế thừa IdentityDbContext để tự động có các bảng Identity:
 //   AspNetUsers, AspNetRoles, AspNetUserRoles, AspNetUserClaims...
 // Generic params: <User, Role, KeyType>
@@ -24,6 +25,12 @@ public class ApplicationDbContext : IdentityDbContext<ApplicationUser, IdentityR
     public DbSet<AppAction> Actions => Set<AppAction>();
     public DbSet<ActionInFunction> ActionInFunctions => Set<ActionInFunction>();
     public DbSet<Permission> Permissions => Set<Permission>();
+
+    // Catalog & e-commerce tables
+    public DbSet<Category> Categories => Set<Category>();
+    public DbSet<Product> Products => Set<Product>();
+    public DbSet<Order> Orders => Set<Order>();
+    public DbSet<OrderItem> OrderItems => Set<OrderItem>();
 
     protected override void OnModelCreating(ModelBuilder builder)
     {
@@ -87,6 +94,73 @@ public class ApplicationDbContext : IdentityDbContext<ApplicationUser, IdentityR
             e.HasOne(x => x.Action)
              .WithMany(a => a.Permissions)
              .HasForeignKey(x => x.ActionId);
+        });
+
+        // ─── Category ─────────────────────────────────────────────────────────────
+        builder.Entity<Category>(e =>
+        {
+            e.ToTable("Categories");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Name).HasMaxLength(200).IsRequired();
+            e.Property(x => x.Description).HasMaxLength(1000);
+        });
+
+        // ─── Product ──────────────────────────────────────────────────────────────
+        builder.Entity<Product>(e =>
+        {
+            e.ToTable("Products");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Name).HasMaxLength(300).IsRequired();
+            e.Property(x => x.Description).HasMaxLength(2000);
+            e.Property(x => x.Price).HasColumnType("decimal(18,2)");
+            e.Property(x => x.ImageUrl).HasMaxLength(500);
+
+            e.HasOne(x => x.Category)
+             .WithMany(c => c.Products)
+             .HasForeignKey(x => x.CategoryId)
+             .OnDelete(DeleteBehavior.Restrict);
+
+            e.HasIndex(x => x.CategoryId);
+            e.HasIndex(x => x.Name);
+        });
+
+        // ─── Order ────────────────────────────────────────────────────────────────
+        builder.Entity<Order>(e =>
+        {
+            e.ToTable("Orders");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.TotalAmount).HasColumnType("decimal(18,2)");
+            e.Property(x => x.Note).HasMaxLength(500);
+            e.Property(x => x.Status).HasConversion<byte>();
+
+            // FK → AspNetUsers (Guid) — không cascade để tránh xóa đơn hàng khi xóa user
+            e.HasOne(x => x.User)
+             .WithMany()
+             .HasForeignKey(x => x.UserId)
+             .OnDelete(DeleteBehavior.Restrict);
+
+            e.HasIndex(x => x.UserId);
+            e.HasIndex(x => x.CreatedAt);
+        });
+
+        // ─── OrderItem ────────────────────────────────────────────────────────────
+        builder.Entity<OrderItem>(e =>
+        {
+            e.ToTable("OrderItems");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.UnitPrice).HasColumnType("decimal(18,2)");
+
+            e.HasOne(x => x.Order)
+             .WithMany(o => o.Items)
+             .HasForeignKey(x => x.OrderId)
+             .OnDelete(DeleteBehavior.Cascade);
+
+            e.HasOne(x => x.Product)
+             .WithMany(p => p.OrderItems)
+             .HasForeignKey(x => x.ProductId)
+             .OnDelete(DeleteBehavior.Restrict);
+
+            e.HasIndex(x => x.OrderId);
         });
     }
 }

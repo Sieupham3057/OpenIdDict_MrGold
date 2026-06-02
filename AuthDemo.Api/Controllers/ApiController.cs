@@ -53,17 +53,4 @@ public class ApiController : ControllerBase
         return Ok(new { message = "Endpoint công khai, không cần đăng nhập." });
     }
 
-    // GET /api/products
-    [HttpGet("products")]
-    public IActionResult GetProducts()
-    {
-        var userId = User.FindFirstValue(OpenIddictConstants.Claims.Subject);
-        _logger.LogInformation("User {UserId} truy cập danh sách sản phẩm", userId);
-
-        return Ok(new[]
-        {
-            new { id = 1, name = "Sản phẩm A", price = 100_000 },
-            new { id = 2, name = "Sản phẩm B", price = 200_000 },
-        });
-    }
 }

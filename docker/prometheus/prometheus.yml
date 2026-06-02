@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 5s        # Thu thập metrics mỗi 5 giây
+  evaluation_interval: 5s
+
+scrape_configs:
+
+  # .NET API — expose qua /metrics (prometheus-net.AspNetCore)
+  # host.docker.internal: trỏ đến máy host khi API chạy local (không phải trong Docker)
+  - job_name: 'dotnet-api'
+    static_configs:
+      - targets: ['host.docker.internal:5000']
+    metrics_path: '/metrics'
+
+  # cAdvisor — CPU/RAM/Network của từng Docker container
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']

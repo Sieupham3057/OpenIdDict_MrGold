@@ -66,6 +66,8 @@ public class WorkerService : IHostedService
         }
 
         await SeedDataAsync(scope.ServiceProvider);
+        await SeedCategoriesAndProductsAsync(scope.ServiceProvider);
+        await SeedTestUsersAsync(scope.ServiceProvider);
     }
 
     private async Task SeedDataAsync(IServiceProvider services)
@@ -285,6 +287,130 @@ public class WorkerService : IHostedService
                     managerEmail);
             }
         }
+    }
+
+    // ─── 4. Test users cho k6 load testing ───────────────────────────────────────
+    // Tạo 100 user với username loadtest_001@test.com → loadtest_100@test.com
+    // Password cố định: TestPass@123 (chỉ dùng cho môi trường dev/test)
+    // Chạy idempotent: kiểm tra user đã tồn tại trước khi tạo
+    private async Task SeedTestUsersAsync(IServiceProvider services)
+    {
+        var userManager = services.GetRequiredService<UserManager<ApplicationUser>>();
+        var roleManager = services.GetRequiredService<RoleManager<IdentityRole<Guid>>>();
+        var dbContext   = services.GetRequiredService<ApplicationDbContext>();
+
+        // Kiểm tra xem đã seed chưa (chỉ cần kiểm tra user đầu tiên)
+        if (await userManager.FindByEmailAsync("loadtest_001@test.com") != null)
+        {
+            _logger.LogInformation("Test users đã tồn tại, bỏ qua seed.");
+            return;
+        }
+
+        // Seed permissions cho role "User": xem sản phẩm + tạo/xem đơn hàng
+        var userRole = await roleManager.FindByNameAsync("User");
+        if (userRole != null)
+        {
+            var userPermissions = new[]
+            {
+                new Permission { RoleId = userRole.Id, FunctionId = "PRODUCT", ActionId = "VIEW"   },
+                new Permission { RoleId = userRole.Id, FunctionId = "ORDER",   ActionId = "VIEW"   },
+                new Permission { RoleId = userRole.Id, FunctionId = "ORDER",   ActionId = "CREATE" },
+            };
+
+            foreach (var perm in userPermissions)
+            {
+                if (!await dbContext.Permissions.AnyAsync(p =>
+                        p.RoleId == perm.RoleId && p.FunctionId == perm.FunctionId && p.ActionId == perm.ActionId))
+                    dbContext.Permissions.Add(perm);
+            }
+
+            await dbContext.SaveChangesAsync();
+            _logger.LogInformation("Đã seed permissions cho role User");
+        }
+
+        // Thêm ORDER.CREATE vào ActionInFunctions nếu chưa có
+        if (!await dbContext.ActionInFunctions.AnyAsync(aif => aif.ActionId == "CREATE" && aif.FunctionId == "ORDER"))
+        {
+            dbContext.ActionInFunctions.Add(new ActionInFunction { ActionId = "CREATE", FunctionId = "ORDER" });
+            await dbContext.SaveChangesAsync();
+        }
+
+        // Tạo 100 test users
+        const string testPassword = "TestPass@123";
+        int created = 0;
+
+        for (int i = 1; i <= 100; i++)
+        {
+            var email = $"loadtest_{i:D3}@test.com";
+            var user  = new ApplicationUser
+            {
+                UserName       = email,
+                Email          = email,
+                FullName       = $"Load Test User {i:D3}",
+                EmailConfirmed = true,
+                IsActive       = true,
+                CreatedAt      = DateTime.UtcNow,
+            };
+
+            var result = await userManager.CreateAsync(user, testPassword);
+            if (result.Succeeded)
+            {
+                await userManager.AddToRoleAsync(user, "User");
+                created++;
+            }
+        }
+
+        _logger.LogInformation("Đã tạo {Count} test users cho k6 load testing", created);
+    }
+
+    // ─── 5. Categories + Products (seed cho load testing) ────────────────────────
+
+    private async Task SeedCategoriesAndProductsAsync(IServiceProvider services)
+    {
+        var dbContext = services.GetRequiredService<ApplicationDbContext>();
+
+        if (await dbContext.Categories.AnyAsync())
+        {
+            _logger.LogInformation("Categories đã tồn tại, bỏ qua seed.");
+            return;
+        }
+
+        var categories = new[]
+        {
+            new Category { Name = "Điện thoại",         Description = "Smartphone các loại",    CreatedAt = DateTime.UtcNow },
+            new Category { Name = "Laptop",             Description = "Máy tính xách tay",       CreatedAt = DateTime.UtcNow },
+            new Category { Name = "Phụ kiện",           Description = "Tai nghe, sạc, ốp lưng", CreatedAt = DateTime.UtcNow },
+            new Category { Name = "Máy tính bảng",      Description = "iPad, Android tablet",    CreatedAt = DateTime.UtcNow },
+            new Category { Name = "Đồng hồ thông minh", Description = "Smartwatch các hãng",     CreatedAt = DateTime.UtcNow },
+        };
+
+        dbContext.Categories.AddRange(categories);
+        await dbContext.SaveChangesAsync();
+        _logger.LogInformation("Đã seed {Count} categories", categories.Length);
+
+        var products = new List<Product>();
+        string[] productLines = { "Pro Max", "Ultra", "Plus", "Standard", "Lite", "Mini", "Air", "Edge", "Note", "Fold" };
+
+        foreach (var cat in categories)
+        {
+            foreach (var line in productLines)
+            {
+                products.Add(new Product
+                {
+                    CategoryId  = cat.Id,
+                    Name        = $"{cat.Name} {line}",
+                    Description = $"Sản phẩm {line} thuộc danh mục {cat.Name}",
+                    Price       = 500_000m + (products.Count * 150_000m),
+                    Stock       = 500,
+                    IsActive    = true,
+                    CreatedAt   = DateTime.UtcNow,
+                });
+            }
+        }
+
+        dbContext.Products.AddRange(products);
+        await dbContext.SaveChangesAsync();
+        _logger.LogInformation("Đã seed {Count} products", products.Count);
     }
 
     // StopAsync gọi khi app shutdown — không cần dọn dẹp gì

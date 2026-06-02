@@ -3,6 +3,7 @@ using AuthDemo.Api.Extensions;
 using AuthDemo.Api.Middleware;
 using AuthDemo.Api.Services;
 using Microsoft.EntityFrameworkCore;
+using Prometheus;
 using Serilog;
 
 Log.Logger = new LoggerConfiguration()
@@ -35,6 +36,7 @@ try
     builder.Services.AddAuthorizationConfig();
     builder.Services.AddSwaggerConfig();
     builder.Services.AddControllers();
+    builder.Services.AddHealthChecks();
     builder.Services.AddHostedService<WorkerService>();
 
     var app = builder.Build();
@@ -55,9 +57,18 @@ try
     // Ghi log HTTP request/response (method, path, status code, thời gian xử lý)
     app.UseSerilogRequestLogging();
 
+    // Track HTTP metrics: request count, duration, in-flight requests theo route
+    app.UseHttpMetrics();
+
     app.UseAuthentication();
     app.UseAuthorization();
     app.MapControllers();
+
+    // GET /metrics — Prometheus scrape endpoint (không yêu cầu auth)
+    app.MapMetrics();
+
+    // GET /health — k6 setup() kiểm tra API online trước khi test
+    app.MapHealthChecks("/health");
 
     // ═══════════════════════════════════════════════════════════════════════════════
     // MIGRATE DATABASE KHI KHỞI ĐỘNG

@@ -13,12 +13,10 @@ namespace AuthDemo.Api.Controllers;
 [Route("api/[controller]")]
 public class RolesController : ControllerBase
 {
-    private readonly ILogger<RolesController> _logger;
     private readonly RoleManager<IdentityRole<Guid>> _roleManager;
     private readonly ApplicationDbContext _dbContext;
 
     public RolesController(
-        ILogger<RolesController> logger,
         RoleManager<IdentityRole<Guid>> roleManager,
         ApplicationDbContext dbContext)
     {
