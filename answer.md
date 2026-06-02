@@ -630,8 +630,53 @@ Sau khi thêm node_exporter, các panel sẽ hiện:
 4. Dashboard tự reload → panels hiện data
 ```
 
-> Nếu dropdown **Instances trống** (không có option nào) → Prometheus chưa scrape được API.
-> Kiểm tra: `http://192.168.1.35:9090` → Status → Targets → `dotnet-api` phải **UP** màu xanh.
+> Nếu dropdown **Instances trống** (không có option nào, chỉ thấy "All") → có 2 khả năng:
+> - **Khả năng 1**: Prometheus chưa scrape được API → vào `http://192.168.1.35:9090` → Status → Targets → `dotnet-api` phải **UP** màu xanh.
+> - **Khả năng 2**: Biến `instances` trong dashboard settings chưa có query → fix theo hướng dẫn bên dưới.
+
+---
+
+##### Fix biến `instances` khi dropdown chỉ hiện "All" (không có option nào)
+
+**Nguyên nhân thực tế**: Vào variable settings sẽ thấy field **Data source đang bỏ trống** ("Select data source") — không có data source thì query không chạy được dù query đúng cú pháp.
+
+**Cách fix — thao tác trong Grafana UI:**
+
+**Bước 1** — Mở dashboard settings:
+
+```
+Góc trên phải dashboard → click icon ✏ Edit → click icon ⚙ Settings
+```
+
+**Bước 2** — Vào Variables:
+
+```
+Sidebar trái trong Settings → chọn "Variables" → click vào biến "instances"
+```
+
+**Bước 3** — Trong section **Query options**, chọn Data source:
+
+Dropdown **Data source** → chọn **Prometheus**
+
+**Bước 4** — Chọn **Query type** (hay bị bỏ qua — đây là lý do Run query không có hiệu ứng gì):
+
+Dropdown **Query type** đang hiện "Select query type" → chọn **"Label values"**
+
+> ⚠️ Query type chưa chọn → Grafana không biết chạy kiểu query nào → Run query im lặng hoàn toàn, Preview of values chỉ hiện "All".
+>
+> Lưu ý: đừng nhập `label_values(...)` vào field **Regex** — Regex là filter kết quả, không phải nơi nhập query expression.
+
+**Bước 5** — Sau khi chọn "Label values", điền vào các field xuất hiện:
+
+| Field | Giá trị |
+|---|---|
+| **Label** | `instance` |
+| **Metric** | `up` |
+| **Label filter** | `job` = `dotnet-api` |
+
+**Bước 6** — Click **Run query** → **Preview of values** ở cuối trang hiện `api:8080` → click **Back to list** → **Save dashboard**
+
+**Kết quả**: Dropdown Instances sẽ hiện `api:8080` thay vì chỉ có "All". Chọn `api:8080` → dashboard tải data bình thường.
 
 **Sau khi chọn Instance, các panel quan trọng:**
 
@@ -732,10 +777,20 @@ Trước khi chạy k6 → tất cả panel đều "No data" / N/A → ĐÚNG, k
 2. Click vào dropdown **Instances** → chọn `api:8080`
 3. Dashboard tự load lại → panels hiện data
 
-> Nếu dropdown `Instances` trống (không có option nào):
-> - Prometheus chưa scrape được API → vào `http://192.168.1.35:9090` → Status → Targets
+> Nếu dropdown `Instances` chỉ hiện "All" (không có option `api:8080`):
+>
+> **Trường hợp A — Prometheus chưa scrape được API:**
+> - Vào `http://192.168.1.35:9090` → Status → Targets
 > - Target `dotnet-api` phải là **UP** (màu xanh)
 > - Nếu DOWN → `docker logs api --tail 20` để xem API có lỗi không
+>
+> **Trường hợp B — Biến `instances` trong dashboard settings chưa cấu hình Query type:**
+> 1. Click icon ✏ **Edit** → icon ⚙ **Settings** (góc trên phải dashboard)
+> 2. Sidebar trái → **Variables** → click biến **instances**
+> 3. Section **Query options** → dropdown **Data source** → chọn **Prometheus**
+> 4. Dropdown **Query type** đang hiện "Select query type" → chọn **"Label values"** ← hay bị bỏ qua, đây là lý do Run query im lặng
+> 5. Các field xuất hiện sau khi chọn "Label values": **Label** = `instance`, **Metric** = `up`, **Label filter**: `job` = `dotnet-api`
+> 6. Click **Run query** → **Preview of values** cuối trang hiện `api:8080` → **Back to list** → **Save dashboard**
 
 **Lưu ý thêm:** Dashboard này chỉ hiện data cho các Controller đã được gọi ít nhất 1 request. Nếu chưa gọi API nào → `Controllers` dropdown cũng trống. Thử gọi:
 
