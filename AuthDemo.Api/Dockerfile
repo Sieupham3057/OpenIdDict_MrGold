@@ -2,45 +2,59 @@
 # BUILD STAGE
 # ============================================================
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+
 WORKDIR /src
 
-# Copy csproj trước để tận dụng Docker layer cache
-# (chỉ re-restore khi csproj thay đổi, không phải mỗi lần sửa code)
+# Copy csproj trước để tận dụng cache
 COPY ["AuthDemo.Api/AuthDemo.Api.csproj", "AuthDemo.Api/"]
+
 RUN dotnet restore "AuthDemo.Api/AuthDemo.Api.csproj"
 
-# Copy toàn bộ source và publish
+# Copy source code
 COPY . .
+
+# Publish
 RUN dotnet publish "AuthDemo.Api/AuthDemo.Api.csproj" \
     -c Release \
     --no-restore \
     -o /app/publish
 
 # ============================================================
-# RUNTIME STAGE — image nhỏ hơn, không có SDK
+# RUNTIME STAGE
 # ============================================================
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
+
 WORKDIR /app
 
-# Chạy bằng non-root user (security best practice)
-RUN groupadd -g 1001 appgroup \
- && useradd -u 1001 -g appgroup -s /bin/false appuser \
- && mkdir -p /app/logs \
- && chown -R appuser:appgroup /app
+# Cài curl để Docker HealthCheck hoạt động
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 
+# Tạo user non-root
+RUN groupadd -g 1001 appgroup \
+    && useradd -u 1001 -g appgroup -s /usr/sbin/nologin appuser \
+    && mkdir -p /app/logs \
+    && chown -R appuser:appgroup /app
+
+# Copy application
 COPY --from=build --chown=appuser:appgroup /app/publish .
 
+# ASP.NET Core
+ENV ASPNETCORE_URLS=http://+:8080
+ENV ASPNETCORE_ENVIRONMENT=Production
+
+# Expose container port
+EXPOSE 8080
+
+# Health Check
 HEALTHCHECK --interval=30s \
             --timeout=10s \
             --start-period=90s \
             --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD curl -fsS http://localhost:8080/health || exit 1
 
+# Chạy bằng user thường
 USER appuser
-
-ENV ASPNETCORE_URLS=http://+:8080
-ENV ASPNETCORE_ENVIRONMENT=Production
-
-EXPOSE 8080
 
 ENTRYPOINT ["dotnet", "AuthDemo.Api.dll"]
