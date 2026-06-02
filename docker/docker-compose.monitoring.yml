@@ -19,6 +19,12 @@ services:
       - '--storage.tsdb.retention.time=7d'
     extra_hosts:
       - "host.docker.internal:host-gateway"   # Cho phép trỏ đến API trên host
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
   # ── Grafana: Visualize metrics từ Prometheus và InfluxDB ───────────────────────
@@ -34,8 +40,16 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
     depends_on:
-      - prometheus
-      - influxdb
+      prometheus:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     restart: unless-stopped
 
   # ── InfluxDB: Lưu kết quả k6 (time-series database) ───────────────────────────
@@ -49,6 +63,12 @@ services:
       - INFLUXDB_HTTP_AUTH_ENABLED=false
     volumes:
       - influxdb-data:/var/lib/influxdb
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
   # ── cAdvisor: Thu thập CPU/RAM/Network của Docker containers ──────────────────
