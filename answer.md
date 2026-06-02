@@ -58,6 +58,17 @@
 - [Tóm tắt quyết định theo môi trường](#tóm-tắt-quyết-định-theo-môi-trường)
 - [Checklist debug khi gặp lỗi](#checklist-debug-khi-gặp-lỗi-certificate-openiddict-trong-docker)
 
+**[Phần 6 — Prometheus Web UI & PromQL thực tế](#phần-6--prometheus-web-ui--promql-thực-tế)**
+- [Prometheus Web UI dùng để làm gì?](#prometheus-web-ui--dùng-để-làm-gì)
+- [Các nhóm PromQL phổ biến thực tế](#các-nhóm-promql-phổ-biến-thực-tế)
+  - [HTTP metrics — đo tải và latency](#1-http-metrics--đo-tải-và-latency)
+  - [.NET process metrics — CPU và bộ nhớ](#2-net-process-metrics--cpu-và-bộ-nhớ)
+  - [.NET GC metrics — theo dõi Garbage Collector](#3-net-gc-metrics--theo-dõi-garbage-collector)
+  - [cAdvisor container metrics](#4-cadvisor-container-metrics)
+- [Các hàm PromQL cốt lõi](#các-hàm-promql-cốt-lõi-cần-biết)
+- [Làm sao biết metric nào tồn tại?](#làm-sao-biết-metric-nào-tồn-tại--tìm-ở-đâu)
+- [Tìm tài liệu ở đâu?](#tìm-tài-liệu-ở-đâu)
+
 ---
 
 ## 1. Server specs này phục vụ được bao nhiêu concurrent user?
@@ -535,15 +546,21 @@ curl -X POST http://192.168.1.35:5000/connect/token \
 
 > InfluxDB lưu kết quả k6 — cần add để Grafana đọc được.
 
-1. Mở `http://localhost:3000`, login `admin / admin123`
+1. Mở `http://192.168.1.35:3000`, login `admin / admin123`
 2. Sidebar trái → **Connections → Data Sources → Add new data source**
 3. Chọn **InfluxDB**
-4. Điền:
-   ```
-   URL:      http://influxdb:8086    ← dùng tên service Docker, không dùng localhost
-   Database: k6
-   ```
+4. Điền các trường sau (scroll xuống để thấy hết):
+
+   | Trường | Giá trị | Ghi chú |
+   |--------|---------|---------|
+   | **URL** | `http://192.168.1.35:8086` | ⚠️ KHÔNG dùng `http://influxdb:8086` — Grafana UI báo "Invalid URL" với hostname không có dấu chấm |
+   | **Database** | `k6` | ⚠️ Bắt buộc — để trống sẽ lỗi "database name required" |
+   | Query Language | InfluxQL | Giữ mặc định |
+   | User / Password | *(để trống)* | InfluxDB 1.8 không cần auth mặc định |
+
 5. Bấm **Save & Test** → phải hiện "datasource is working"
+
+> **Tại sao dùng IP thay hostname?** Grafana frontend validate URL — hostname không có TLD như `influxdb` bị reject ở UI. Dùng IP `192.168.1.35` bypass được validation này. Port 8086 đã map ra ngoài nên Grafana backend kết nối được.
 
 ### 3.2 Thêm datasource Prometheus (cho .NET API metrics)
 
@@ -1895,4 +1912,368 @@ Bước 5 — Nếu đã có cờ nhưng cert không load được:
   → Nếu không có: kiểm tra docker-compose volumes đã mount đúng chưa
   docker exec api printenv | grep OpenIddict
   → OpenIddict__CertPath và OpenIddict__CertPassword đã được set chưa?
+```
+
+---
+
+---
+
+# PHẦN 6 — Prometheus Web UI & PromQL thực tế
+
+> Prometheus UI tại `http://localhost:9090` — dùng để debug nhanh, kiểm tra metric trước khi đưa lên Grafana.
+
+---
+
+## Prometheus Web UI — Dùng để làm gì?
+
+```
+http://localhost:9090
+  │
+  ├── Status → Targets          Xem target nào UP/DOWN, lần scrape cuối lúc nào
+  ├── Status → Configuration    Xem nội dung prometheus.yml đang áp dụng
+  ├── Status → Service Discovery Xem Prometheus đang discover service nào
+  └── Graph (trang chính)       Gõ PromQL → xem số liệu dạng bảng hoặc đồ thị
+```
+
+Tab **Graph** là nơi bạn sẽ dùng nhiều nhất:
+
+```
+1. Gõ metric name vào ô Expression  (có autocomplete)
+2. Bấm Execute
+3. Chọn tab "Table" để xem giá trị tức thời, hoặc "Graph" để xem theo thời gian
+4. Điều chỉnh time range góc trên phải (mặc định 1 giờ)
+```
+
+> Prometheus UI chỉ dùng để debug/kiểm tra nhanh. Để xem đẹp và lưu layout → dùng Grafana.
+
+---
+
+## Các nhóm PromQL phổ biến thực tế
+
+### 1. HTTP metrics — Đo tải và latency
+
+Các metric này do `prometheus-net.AspNetCore` tự động sinh ra khi bạn gọi `app.UseHttpMetrics()`.
+
+```promql
+# Số request mỗi giây (tính trung bình trong 1 phút qua)
+rate(http_requests_received_total[1m])
+
+# Tách theo HTTP status code — tìm lỗi 5xx
+rate(http_requests_received_total{code=~"5.."}[1m])
+
+# Tách theo route — route nào đang bị gọi nhiều nhất?
+sum(rate(http_requests_received_total[1m])) by (controller, action)
+
+# Tổng request đang xử lý đồng thời (in-flight)
+http_requests_in_progress
+
+# p95 latency — 95% request hoàn thành trong bao nhiêu giây?
+# Đây là query quan trọng nhất để đánh giá performance
+histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+
+# p95 latency tách theo route
+histogram_quantile(0.95,
+  sum(rate(http_request_duration_seconds_bucket[5m])) by (le, controller, action)
+)
+
+# Tỷ lệ lỗi — nên dưới 1%
+sum(rate(http_requests_received_total{code=~"5.."}[1m]))
+  /
+sum(rate(http_requests_received_total[1m]))
+```
+
+**Đọc kết quả:**
+
+| Query | Giá trị bình thường | Dấu hiệu xấu |
+|---|---|---|
+| `rate(...[1m])` cho req/s | Tùy tải, xem xu hướng | Drop đột ngột |
+| p95 latency | < 500ms cho GET, < 2s cho POST | > 3s → bottleneck |
+| Error rate | < 0.01 (1%) | > 0.05 (5%) → điều tra ngay |
+| `http_requests_in_progress` | < 50 | > 200 → Kestrel đang queue |
+
+---
+
+### 2. .NET process metrics — CPU và bộ nhớ
+
+Các metric này do chính .NET runtime tự động expose — không cần cài thêm gì.
+
+```promql
+# Tổng CPU (giây) process đã dùng kể từ khi start — dùng rate() để ra %
+process_cpu_seconds_total
+
+# CPU usage trong 1 phút qua (giá trị từ 0 đến số core, ví dụ 0.7 = 70% của 1 core)
+rate(process_cpu_seconds_total[1m])
+
+# RAM process đang chiếm (bytes) — đây là RSS, bao gồm cả managed heap + native
+process_resident_memory_bytes
+
+# RAM virtual (địa chỉ ảo được map, thường lớn hơn RSS nhiều)
+process_virtual_memory_bytes
+
+# Số file descriptor đang mở (socket, file, pipe)
+# Nếu tăng liên tục → resource leak
+process_open_fds
+
+# Số thread đang chạy
+process_num_threads
+
+# Thời gian process đã sống (giây) — dùng để biết khi nào container restart
+process_start_time_seconds
+```
+
+**Tại sao `rate(process_cpu_seconds_total[1m])` mà không dùng thẳng?**
+
+`process_cpu_seconds_total` là **counter** — chỉ tăng, không bao giờ giảm (như đồng hồ đo điện). Dùng `rate()` để tính tốc độ tăng trong khoảng thời gian → ra số giây CPU dùng mỗi giây thực → gần bằng % CPU.
+
+---
+
+### 3. .NET GC metrics — Theo dõi Garbage Collector
+
+Các metric này từ `prometheus-net` (khi dùng `UseHttpMetrics()`):
+
+```promql
+# Số lần GC chạy theo thế hệ (Gen0 chạy nhiều nhất, Gen2 tốn nhất)
+dotnet_gc_collections_total
+
+# Tần suất GC — số lần/giây trong 5 phút qua
+rate(dotnet_gc_collections_total[5m])
+
+# Kích thước heap theo thế hệ (bytes) — xem gen nào đang chiếm nhiều RAM
+dotnet_gc_heap_size_bytes
+
+# Tổng bytes đã được allocate kể từ khi start
+dotnet_gc_allocated_bytes_total
+
+# Tốc độ cấp phát bộ nhớ (bytes/giây) — cho biết app đang tạo object nhanh thế nào
+rate(dotnet_gc_allocated_bytes_total[1m])
+```
+
+**Đọc GC metrics:**
+
+```
+Gen0 rate cao → bình thường, GC Gen0 nhanh và thường xuyên
+Gen1 rate cao → hơi bất thường, object sống qua 1 lần GC Gen0
+Gen2 rate tăng liên tục → nguy hiểm — có object sống rất lâu (có thể memory leak)
+
+dotnet_gc_heap_size_bytes tăng không ngừng dù Gen2 đã chạy
+→ Dấu hiệu memory leak — cần profiler (dotnet-dump, dotMemory)
+```
+
+---
+
+### 4. cAdvisor container metrics
+
+cAdvisor expose metrics cho **tất cả container Docker** — dùng label `name` để lọc theo tên container.
+
+```promql
+# CPU container api dùng trong 1 phút (kết quả từ 0 đến số core)
+rate(container_cpu_usage_seconds_total{name="api"}[1m])
+
+# RAM container api đang dùng (bytes)
+container_memory_usage_bytes{name="api"}
+
+# RAM container api — chỉ tính working set (loại trừ cache có thể giải phóng)
+container_memory_working_set_bytes{name="api"}
+
+# Network bytes gửi đi từ container api (bytes tích lũy, dùng rate() ra bytes/s)
+rate(container_network_transmit_bytes_total{name="api"}[1m])
+
+# Network bytes nhận vào container api
+rate(container_network_receive_bytes_total{name="api"}[1m])
+
+# Disk I/O — bytes đọc từ đĩa
+rate(container_fs_reads_bytes_total{name="api"}[1m])
+
+# Xem tất cả container, không lọc theo tên — sort by RAM
+sort_desc(container_memory_usage_bytes{name!=""})
+```
+
+**So sánh `process_resident_memory_bytes` (từ .NET) và `container_memory_usage_bytes` (từ cAdvisor):**
+
+```
+process_resident_memory_bytes   → RAM mà .NET process thấy từ bên trong
+container_memory_usage_bytes    → RAM container thực sự chiếm theo Docker/kernel
+                                  (bao gồm cả buffer, cache của container)
+
+Thường: container_memory_usage_bytes >= process_resident_memory_bytes
+Nếu cách nhau quá xa → container đang cache nhiều data từ đĩa
+```
+
+---
+
+## Các hàm PromQL cốt lõi cần biết
+
+| Hàm | Dùng cho | Ví dụ |
+|---|---|---|
+| `rate(metric[window])` | Counter → tính tốc độ tăng/giây | `rate(http_requests_received_total[1m])` |
+| `increase(metric[window])` | Counter → tổng tăng trong khoảng thời gian | `increase(dotnet_gc_collections_total[1h])` |
+| `histogram_quantile(φ, metric)` | Histogram → tính percentile (p50, p95, p99) | `histogram_quantile(0.95, rate(...bucket[5m]))` |
+| `sum(metric) by (label)` | Gộp nhiều time series, tách theo label | `sum(rate(...[1m])) by (controller)` |
+| `avg(metric)` | Trung bình các instance | `avg(process_cpu_seconds_total)` |
+| `max(metric)` | Instance tệ nhất | `max(container_memory_usage_bytes)` |
+| `delta(metric[window])` | Gauge → thay đổi trong khoảng thời gian | `delta(process_resident_memory_bytes[10m])` |
+| `absent(metric)` | Alert khi metric không còn tồn tại (target DOWN) | `absent(up{job="dotnet-api"})` |
+
+**Phân biệt Counter vs Gauge:**
+
+```
+Counter: chỉ tăng, không bao giờ giảm
+  → Luôn dùng rate() hoặc increase() để có nghĩa
+  → Ví dụ: http_requests_received_total, dotnet_gc_collections_total
+
+Gauge: có thể tăng hoặc giảm
+  → Dùng thẳng, không cần rate()
+  → Ví dụ: process_resident_memory_bytes, http_requests_in_progress
+
+Histogram: phân phối giá trị thành các "bucket" (rổ)
+  → Dùng histogram_quantile() + rate() để ra percentile
+  → Ví dụ: http_request_duration_seconds
+```
+
+---
+
+## Làm sao biết metric nào tồn tại? Tìm ở đâu?
+
+### Cách 1 — Xem thẳng endpoint `/metrics` của API
+
+```bash
+# Xem tất cả metric API đang expose
+curl http://localhost:5000/metrics
+
+# Lọc chỉ metric liên quan đến HTTP
+curl http://localhost:5000/metrics | grep "^http_"
+
+# Lọc metric liên quan đến .NET GC
+curl http://localhost:5000/metrics | grep "^dotnet_gc"
+
+# Lọc theo process
+curl http://localhost:5000/metrics | grep "^process_"
+```
+
+Mỗi metric có 2 dòng header giải thích:
+```
+# HELP http_requests_received_total Provides the count of HTTP requests that have been processed by the ASP.NET Core pipeline.
+# TYPE http_requests_received_total counter
+http_requests_received_total{code="200",method="GET"} 12450
+```
+
+Đây là nguồn chính xác nhất — bạn **chỉ có thể dùng metric nào đang được expose**.
+
+### Cách 2 — Autocomplete trong Prometheus UI
+
+Vào `http://localhost:9090` → Graph tab → bắt đầu gõ tên metric → Prometheus tự gợi ý tất cả metric đang có.
+
+Ví dụ: gõ `http_` → sẽ thấy toàn bộ metric HTTP từ API.
+
+### Cách 3 — Prometheus UI → Status → TSDB Status
+
+Trang này liệt kê các metric đang chiếm nhiều bộ nhớ nhất — giúp biết cái gì đang tồn tại:
+
+```
+http://localhost:9090/tsdb-status
+```
+
+### Cách 4 — Xem metrics cAdvisor expose
+
+```bash
+curl http://localhost:8080/metrics | grep "^container_" | grep -o "^[^{]*" | sort -u
+```
+
+Lệnh này lấy tên tất cả metric bắt đầu bằng `container_` mà cAdvisor đang expose.
+
+---
+
+## Tìm tài liệu ở đâu?
+
+### 1. Tài liệu chính thức Prometheus
+
+```
+https://prometheus.io/docs/prometheus/latest/querying/basics/
+  → PromQL syntax, operators, functions
+
+https://prometheus.io/docs/prometheus/latest/querying/functions/
+  → Danh sách đầy đủ tất cả hàm PromQL (rate, increase, histogram_quantile, v.v.)
+
+https://prometheus.io/docs/practices/naming/
+  → Quy ước đặt tên metric — giúp đoán tên metric mới
+```
+
+### 2. Tài liệu prometheus-net (thư viện .NET đang dùng)
+
+```
+https://github.com/prometheus-net/prometheus-net
+  → README liệt kê tất cả metric mà UseHttpMetrics() tự sinh ra
+  → Tên chính xác của từng metric, labels có sẵn
+```
+
+Đây là tài liệu quan trọng nhất để biết metric nào có trong dự án .NET — vì tên metric do thư viện định nghĩa, không phải do Prometheus.
+
+### 3. Grafana Explore tab — thực hành tốt nhất
+
+```
+http://localhost:3000 → Explore (icon kính lúp bên trái)
+  → Chọn datasource Prometheus
+  → Có autocomplete và gợi ý label
+  → Thử query trực tiếp, kết quả hiện ngay
+```
+
+Grafana Explore tốt hơn Prometheus UI vì: autocomplete thông minh hơn, vẽ đồ thị đẹp hơn, có thể so sánh 2 query cạnh nhau.
+
+### 4. Dashboard Grafana.com làm tài liệu tham khảo
+
+Vào `https://grafana.com/grafana/dashboards/` → tìm dashboard bạn đã import (ví dụ ID 10915) → click **Download JSON** → mở file JSON → tìm trường `"expr"`:
+
+```json
+"expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, controller, action))"
+```
+
+Đây là cách học PromQL nhanh nhất: xem query trong dashboard có sẵn rồi hiểu từng phần.
+
+### 5. Tài liệu cAdvisor metrics
+
+```
+https://github.com/google/cadvisor/blob/master/docs/storage/prometheus.md
+  → Danh sách đầy đủ tất cả metric cAdvisor expose
+  → Ý nghĩa từng metric, unit đo
+```
+
+---
+
+## Workflow thực tế khi cần tìm metric mới
+
+```
+Câu hỏi: "Tôi muốn xem số lần .NET thread pool bị đầy (thread starvation)"
+
+Bước 1 — Tìm tên metric:
+  curl http://localhost:5000/metrics | grep -i "thread"
+  → Thấy: dotnet_threadpool_queue_length, dotnet_threadpool_num_threads
+
+Bước 2 — Hiểu loại metric:
+  # TYPE dotnet_threadpool_queue_length gauge
+  → Gauge → dùng thẳng, không cần rate()
+
+Bước 3 — Thử trong Prometheus UI:
+  http://localhost:9090 → Graph → gõ: dotnet_threadpool_queue_length
+  → Xem giá trị hiện tại
+
+Bước 4 — Thêm vào Grafana dashboard:
+  Dashboard → Edit panel → Query → dán query vào
+  → đặt alert nếu > 0 trong hơn 30 giây
+```
+
+### Cheat sheet: metric nào dùng cho mục đích gì
+
+```
+Mục đích                           │ Metric nên dùng
+───────────────────────────────────│─────────────────────────────────────────
+Số request/giây                    │ rate(http_requests_received_total[1m])
+p95 latency                        │ histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+Tỷ lệ lỗi                          │ rate({code=~"5.."}[1m]) / rate(total[1m])
+CPU API process                    │ rate(process_cpu_seconds_total[1m])
+RAM API process                    │ process_resident_memory_bytes
+GC pressure                        │ rate(dotnet_gc_collections_total{generation="2"}[5m])
+Thread pool bão hòa                │ dotnet_threadpool_queue_length
+CPU container (qua Docker)         │ rate(container_cpu_usage_seconds_total{name="api"}[1m])
+RAM container (qua Docker)         │ container_memory_working_set_bytes{name="api"}
+API có còn sống không              │ up{job="dotnet-api"} (1=UP, 0=DOWN)
 ```
