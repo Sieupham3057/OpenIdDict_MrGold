@@ -16,7 +16,7 @@ services:
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       # Override connection string không cần rebuild image khi đổi server
-      - ConnectionStrings__DefaultConnection=Server=192.168.1.35,1433;Database=AuthDemoDB;User Id=sa;Password=YourStrong@Passw0rd2026;TrustServerCertificate=True;
+      - ConnectionStrings__DefaultConnection=Server=192.168.1.35,1433;Database=AuthDemoDB;User Id=sa;Password=YourStrong@Passw0rd;TrustServerCertificate=True;
     volumes:
       - api-logs:/app/logs                 # Giữ log khi container restart
     healthcheck:
