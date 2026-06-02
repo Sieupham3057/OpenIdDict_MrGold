@@ -19,12 +19,6 @@ services:
       - ConnectionStrings__DefaultConnection=Server=192.168.1.35,1433;Database=AuthDemoDB;User Id=sa;Password=YourStrong@Passw0rd;TrustServerCertificate=True;
     volumes:
       - api-logs:/app/logs                 # Giữ log khi container restart
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 90s                    # Chờ WorkerService seed xong + Kestrel start trước khi check
     restart: unless-stopped
 
   # ── Prometheus: Thu thập và lưu metrics theo dạng time-series ──────────────────

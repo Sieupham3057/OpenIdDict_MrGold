@@ -30,10 +30,9 @@ RUN groupadd -g 1001 appgroup \
 
 COPY --from=build --chown=appuser:appgroup /app/publish .
 
-# Healthcheck — gọi /health endpoint mà Program.cs đã đăng ký
 HEALTHCHECK --interval=30s \
             --timeout=10s \
-            --start-period=40s \
+            --start-period=90s \
             --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
