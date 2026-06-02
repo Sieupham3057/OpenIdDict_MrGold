@@ -335,15 +335,20 @@ Bước 6: Lặp lại Bước 3–5
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                          MÁY CỦA BẠN (host)                            │
+│                SERVER (192.168.1.35) — toàn bộ chạy Docker             │
 │                                                                         │
-│   ┌─────────────────┐          ┌──────────────────────────────────┐    │
-│   │  dotnet run     │          │         Docker Compose           │    │
-│   │  AuthDemo.Api   │◄─scrape──│  Prometheus (9090)               │    │
-│   │  :5000          │          │  Grafana    (3000) ◄─── bạn xem  │    │
-│   │  GET /metrics   │          │  InfluxDB   (8086) ◄─── k6 ghi   │    │
-│   │  GET /health    │          │  cAdvisor   (8080) ← monitor Docker│   │
-│   └─────────────────┘          └──────────────────────────────────┘    │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                      Docker Compose Network                      │   │
+│  │                                                                  │   │
+│  │  ┌─────────────────┐   scrape   ┌──────────────────────────┐   │   │
+│  │  │  api            │◄───────────│  Prometheus (9090)        │   │   │
+│  │  │  :8080 (→5000)  │            │                          │   │   │
+│  │  │  GET /metrics   │            │  Grafana    (3000) ◄──bạn│   │   │
+│  │  │  GET /health    │            │  InfluxDB   (8086) ◄──k6 │   │   │
+│  │  └─────────────────┘            │  cAdvisor   (8080)       │   │   │
+│  │       ↑ cAdvisor                └──────────────────────────┘   │   │
+│  │       theo dõi container này                                    │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
 │                                                                         │
 │   ┌─────────────────┐                                                   │
 │   │  k6 run         │──────────► POST /connect/token  (login)           │
@@ -355,88 +360,99 @@ Bước 6: Lặp lại Bước 3–5
 ```
 
 **Vai trò từng thành phần:**
+- **api**: AuthDemo .NET 8 chạy trong Docker container, port 8080 bên trong, map ra host port 5000
 - **k6**: giả lập hàng trăm/nghìn user thật — login, đọc sản phẩm, tạo đơn hàng
-- **Prometheus**: cứ 5 giây lại "hỏi" API endpoint `/metrics` để lấy số liệu về CPU, request count, latency
-- **InfluxDB**: k6 đẩy kết quả test vào đây theo thời gian thực (time-series database)
-- **Grafana**: đọc cả Prometheus lẫn InfluxDB rồi vẽ đồ thị — bạn nhìn vào đây để hiểu hệ thống đang làm gì
-- **cAdvisor**: theo dõi Docker container (CPU/RAM của từng container, không phải của API)
+- **Prometheus**: cứ 5 giây scrape `api:8080/metrics` để lấy CPU, request count, latency (dùng tên service Docker, không cần IP)
+- **InfluxDB**: k6 đẩy kết quả test vào đây theo thời gian thực
+- **Grafana**: đọc cả Prometheus lẫn InfluxDB rồi vẽ đồ thị
+- **cAdvisor**: theo dõi tất cả container trong Docker kể cả `api` — giờ thấy được CPU/RAM của API
 
 ---
 
-## Bước 1 — Khởi động Monitoring Stack
+## Bước 1 — Khởi động toàn bộ stack (API + Monitoring)
 
-### 1.1 Chạy lệnh
+### 1.1 Lần đầu — Build image và chạy
 
 ```bash
-# Đứng ở thư mục gốc project (e:\TECHLEAD_PROJECT\OpenIdDict)
-cd docker
-docker compose -f docker-compose.monitoring.yml up -d
+# Đứng ở thư mục docker/ trên server
+cd ~/projects/OpenIdDict_MrGold/docker
+
+# --build: build Docker image cho API từ Dockerfile (lần đầu mất ~2-3 phút)
+docker compose -f docker-compose.monitoring.yml up -d --build
 ```
 
-> **`-d`** = detached mode, chạy ngầm, không chiếm terminal.
+> Lần sau (không đổi code) dùng `up -d` thôi — không cần `--build` vì image đã được cache.
 
-### 1.2 Kiểm tra tất cả container đang sống
+> **Lý do API chạy Docker thay vì `dotnet run`:** Dockerfile cũ bị broken (copy project không tồn tại). Sau khi sửa, toàn bộ stack — API + monitoring — đều chạy trong Docker cùng một network, Prometheus dùng tên service `api:8080` thay vì `host.docker.internal`.
+
+### 1.2 Kiểm tra tất cả 5 container đang chạy
 
 ```bash
 docker compose -f docker-compose.monitoring.yml ps
 ```
 
-Kết quả phải thấy:
+Kết quả kỳ vọng (tất cả phải `(healthy)`):
 ```
 NAME         STATUS
-prometheus   running
-grafana      running
-influxdb     running
+api          running (healthy)    ← API .NET 8, port 5000
+prometheus   running (healthy)
+grafana      running (healthy)
+influxdb     running (healthy)
 cadvisor     running
 ```
 
-Nếu có container `Exited` → xem log để debug:
+> `api` và `prometheus` có `depends_on` nên start theo thứ tự: influxdb/api → prometheus → grafana.
+> Nếu `api` chưa healthy, Prometheus chưa start — đây là đúng thiết kế.
+
+Nếu có container `Exited` → xem log:
 ```bash
-docker logs prometheus   # thay tên container tương ứng
+docker logs api          # xem lỗi startup, migration DB
+docker logs prometheus
 ```
 
 ### 1.3 Verify từng service
 
 | Service | URL | Kỳ vọng |
 |---|---|---|
-| Prometheus | `http://localhost:9090` | Trang web UI hiện lên |
-| Grafana | `http://localhost:3000` | Login page (admin / admin123) |
-| InfluxDB | `http://localhost:8086/ping` | Trả về HTTP 204 (không có body) |
-| cAdvisor | `http://localhost:8080` | Dashboard container metrics |
+| **API** | `http://192.168.1.35:5000/health` | `{"status":"Healthy"}` |
+| **API metrics** | `http://192.168.1.35:5000/metrics` | Hàng trăm dòng `# HELP ...` |
+| Prometheus | `http://192.168.1.35:9090` | Web UI → Status → Targets: `api` = UP |
+| Grafana | `http://192.168.1.35:3000` | Login page (admin / admin123) |
+| InfluxDB | `http://192.168.1.35:8086/ping` | HTTP 204, không có body |
+| cAdvisor | `http://192.168.1.35:8080` | Dashboard container metrics |
 
 ---
 
-## Bước 2 — Khởi động API và Verify
+## Bước 2 — Verify API hoạt động đúng
 
-### 2.1 Chạy API
+### 2.1 Xem log API để confirm seed thành công
 
 ```bash
-# Mở terminal mới, đứng ở thư mục gốc
-cd AuthDemo.Api
-dotnet run
+docker logs api --follow
 ```
 
-Chờ thấy 2 dòng log quan trọng:
+Chờ thấy 2 dòng quan trọng rồi Ctrl+C:
 ```
 [INF] Đã tạo 100 test users cho k6 load testing   ← WorkerService seed xong
 [INF] Application started. Press Ctrl+C to shut down.
 ```
 
-> WorkerService tự động seed 100 user vào DB khi app khởi động. Không cần chạy script SQL thủ công.
+> WorkerService tự động seed 100 test user vào DB khi container khởi động.
+> Migration DB (`MigrateAsync`) cũng chạy tự động — không cần chạy tay.
 
 ### 2.2 Verify 3 endpoint cần thiết
 
 ```bash
-# 1. Health check — k6 kiểm tra trước khi test
-curl http://localhost:5000/health
+# 1. Health check — k6 gọi trước khi test (setup())
+curl http://192.168.1.35:5000/health
 # Kỳ vọng: {"status":"Healthy"}
 
-# 2. Metrics endpoint — Prometheus scrape endpoint này
-curl http://localhost:5000/metrics
-# Kỳ vọng: thấy hàng trăm dòng bắt đầu bằng "# HELP" và số liệu
+# 2. Metrics endpoint — Prometheus scrape endpoint này mỗi 5 giây
+curl http://192.168.1.35:5000/metrics | head -20
+# Kỳ vọng: thấy dòng # HELP, # TYPE và số liệu
 
 # 3. Thử login với 1 test user (xác nhận seed thành công)
-curl -X POST http://localhost:5000/connect/token \
+curl -X POST http://192.168.1.35:5000/connect/token \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "grant_type=password&client_id=angular-spa&username=loadtest_001@test.com&password=TestPass@123&scope=openid profile email roles"
 # Kỳ vọng: {"access_token":"eyJ...","token_type":"Bearer","expires_in":3600}
@@ -444,11 +460,12 @@ curl -X POST http://localhost:5000/connect/token \
 
 ### 2.3 Verify Prometheus đang scrape API
 
-1. Mở `http://localhost:9090`
+1. Mở `http://192.168.1.35:9090`
 2. Vào **Status → Targets**
 3. Target `dotnet-api` phải có `State = UP` màu xanh
 
-> Nếu `DOWN`: API chưa chạy, hoặc port sai. Prometheus dùng `host.docker.internal:5000` để trỏ vào API trên host machine.
+> Prometheus dùng `api:8080` (tên service Docker, port nội bộ) — không phải `localhost:5000`.
+> Nếu `DOWN` mà container `api` đang `healthy`: reload Prometheus config bằng `curl -X POST http://192.168.1.35:9090/-/reload`
 
 ---
 
@@ -505,13 +522,12 @@ Nếu không cài k6 local, dùng Docker:
 ```bash
 docker run --rm -i \
   -v ${PWD}/k6:/scripts \
-  --add-host=host.docker.internal:host-gateway \
   grafana/k6 run \
-    --env BASE_URL=http://host.docker.internal:5000 \
+    --env BASE_URL=http://192.168.1.35:5000 \
     /scripts/smoke-test.js
 ```
 
-> `--add-host=host.docker.internal:host-gateway` = cho phép container k6 trỏ vào API trên host machine (Windows/Linux). Trên Mac thì `host.docker.internal` tự động có sẵn.
+> API giờ chạy trong Docker và expose port 5000 ra host. k6 kết nối qua IP của server `192.168.1.35:5000` — không cần `host.docker.internal` nữa.
 
 **Smoke test PASS khi:**
 ```
@@ -539,18 +555,17 @@ k6 run \
   k6/load-test.js
 ```
 
-Docker:
+Docker (nếu không cài k6 local):
 ```bash
 docker run --rm -i \
   -v ${PWD}/k6:/scripts \
-  --network host \
   grafana/k6 run \
-    --out influxdb=http://localhost:8086/k6 \
-    --env BASE_URL=http://localhost:5000 \
+    --out influxdb=http://192.168.1.35:8086/k6 \
+    --env BASE_URL=http://192.168.1.35:5000 \
     /scripts/load-test.js
 ```
 
-> `--network host` = container dùng thẳng network của host → có thể kết nối tới InfluxDB và API qua localhost. Chỉ dùng được trên Linux; trên Windows/Mac dùng `host.docker.internal`.
+> Dùng IP của server thay vì `localhost` vì k6 container không nằm trong cùng Docker network với InfluxDB và API. Cả InfluxDB (8086) lẫn API (5000) đều đã expose ra host nên truy cập được qua IP.
 
 Trong lúc k6 chạy, **mở Grafana dashboard ID 2587** để xem real-time.
 
@@ -743,7 +758,7 @@ docker stats --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
 # cadvisor     3.2%      128MiB / 16GiB
 ```
 
-> cAdvisor chỉ theo dõi các container trong Docker. API đang chạy trên host (`dotnet run`) nên không thấy ở đây — xem qua Grafana dashboard .NET (ID 10915) hoặc `process_cpu_seconds_total` trong Prometheus.
+> API giờ chạy trong Docker container (`api`) nên cAdvisor thấy được. `docker stats` sẽ hiện luôn container `api` cùng với các container monitoring.
 
 ---
 
@@ -819,7 +834,7 @@ k6 báo lỗi hoặc latency cao
          │
          ▼
 ┌────────────────────────────┐
-│ Error rate > 5%?           │──Có──► Xem log API: dotnet run terminal
+│ Error rate > 5%?           │──Có──► Xem log API: docker logs api --follow
 │                            │         Tìm exception, 500 error
 └────────────────────────────┘
          │ Không
@@ -864,15 +879,13 @@ k6 báo lỗi hoặc latency cao
 ## Checklist trước mỗi lần chạy test
 
 ```
-[ ] docker compose ps  → 4 container đang running
-[ ] curl localhost:5000/health  → {"status":"Healthy"}
-[ ] curl localhost:5000/metrics  → thấy số liệu (không phải 404)
-[ ] docker compose ps  → 4 container đang running (healthy)
-[ ] curl localhost:5000/health  → {"status":"Healthy"}
-[ ] curl localhost:5000/metrics  → thấy số liệu (không phải 404)
-[ ] curl localhost:8086/ping  → HTTP 204 (InfluxDB healthy, KHÔNG có body là đúng)
-[ ] localhost:9090 → Status → Targets → dotnet-api = UP
-[ ] localhost:3000  → Grafana login được, datasource hoạt động
+[ ] docker compose ps → 5 container đang running, api và influxdb/prometheus/grafana phải (healthy)
+[ ] docker logs api --follow → thấy "Đã tạo 100 test users" và "Application started"
+[ ] curl 192.168.1.35:5000/health → {"status":"Healthy"}
+[ ] curl 192.168.1.35:5000/metrics → thấy dòng # HELP (không phải 404)
+[ ] curl 192.168.1.35:8086/ping → HTTP 204 (InfluxDB healthy, không có body là đúng)
+[ ] 192.168.1.35:9090 → Status → Targets → dotnet-api = UP (xanh)
+[ ] 192.168.1.35:3000 → Grafana login được, 2 datasource đã add
 [ ] Smoke test PASS (2 VU, 0% error)
 [ ] Mở SSMS sẵn với 3 query monitor ở trên
 [ ] Ghi lại thời điểm bắt đầu test để correlate với Grafana timeline
@@ -997,7 +1010,7 @@ Prometheus là **monitoring system** hoạt động theo mô hình **pull**: c�
 
 ```
 Mỗi 5 giây:
-  Prometheus → GET http://host.docker.internal:5000/metrics
+  Prometheus → GET http://api:8080/metrics   ← dùng tên service Docker
   API trả về:
     http_requests_received_total{code="200",method="GET"} 12450
     http_request_duration_seconds_bucket{le="0.1"} 8230
@@ -1089,18 +1102,27 @@ cAdvisor (đang chạy trong container)
 - Lưu lịch sử qua Prometheus
 - Hiện thị trong Grafana dashboard ID 893
 
-### Hạn chế của cAdvisor trong project này
+### cAdvisor trong project này — giờ có ý nghĩa thực sự
 
-> **Quan trọng:** cAdvisor chỉ theo dõi **container**, không theo dõi process chạy trực tiếp trên host.
+> API đã chạy trong Docker container (`api`), nên cAdvisor **thấy được** nó.
 
-Vì API (`dotnet run`) chạy **ngoài Docker**, cAdvisor **không thấy** nó. Để xem CPU/RAM của .NET API:
-- Dùng Grafana dashboard ID 10915 (đọc từ Prometheus → `process_cpu_seconds_total`)
-- Hoặc `docker stats` nếu API chạy trong container
+cAdvisor sẽ expose metrics cho container `api`:
+```
+container_cpu_usage_seconds_total{name="api"}       ← CPU của .NET API
+container_memory_usage_bytes{name="api"}            ← RAM của .NET API
+container_network_transmit_bytes_total{name="api"}  ← Network out
+```
+
+Xem trong Grafana dashboard ID 893 → chọn container `api` để thấy resource usage theo thời gian thực trong lúc k6 chạy.
+
+Kết hợp với dashboard ID 10915 (.NET metrics từ Prometheus) cho bức tranh đầy đủ:
+- cAdvisor → biết container đang dùng bao nhiêu CPU/RAM ở tầng OS
+- Prometheus → biết bên trong .NET: GC bao nhiêu lần, thread pool queue bao nhiêu
 
 ### Nhược điểm cAdvisor
 
-- **Chỉ có ý nghĩa khi app chạy trong Docker**: Trong setup hiện tại (API chạy `dotnet run` ngoài Docker), cAdvisor chỉ theo dõi Prometheus, Grafana, InfluxDB — những thứ nhẹ, không phải điểm cần quan tâm.
-- **Privileged access**: Cần mount `/`, `/sys`, `/var/run` → security concern trong production.
+- **Privileged access**: Cần mount `/`, `/sys`, `/var/run` → security concern trong production. Chỉ phù hợp môi trường lab/monitoring nội bộ.
+- **Overhead nhỏ**: cAdvisor chạy liên tục đọc `/proc` — tốn ~3–5% CPU của host. Không đáng kể với 2 core lab.
 
 ---
 
