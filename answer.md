@@ -867,9 +867,280 @@ k6 báo lỗi hoặc latency cao
 [ ] docker compose ps  → 4 container đang running
 [ ] curl localhost:5000/health  → {"status":"Healthy"}
 [ ] curl localhost:5000/metrics  → thấy số liệu (không phải 404)
+[ ] docker compose ps  → 4 container đang running (healthy)
+[ ] curl localhost:5000/health  → {"status":"Healthy"}
+[ ] curl localhost:5000/metrics  → thấy số liệu (không phải 404)
+[ ] curl localhost:8086/ping  → HTTP 204 (InfluxDB healthy, KHÔNG có body là đúng)
 [ ] localhost:9090 → Status → Targets → dotnet-api = UP
 [ ] localhost:3000  → Grafana login được, datasource hoạt động
 [ ] Smoke test PASS (2 VU, 0% error)
 [ ] Mở SSMS sẵn với 3 query monitor ở trên
 [ ] Ghi lại thời điểm bắt đầu test để correlate với Grafana timeline
 ```
+
+---
+
+---
+
+# PHẦN 3 — Hiểu Từng Thành Phần Trong Hệ Thống
+
+---
+
+## Tại sao lại cần nhiều tool như vậy?
+
+Câu hỏi hợp lý. Câu trả lời ngắn: **mỗi tool giải quyết 1 bài toán khác nhau mà tool kia không làm được.**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Bài toán               │ Tool giải quyết  │ Tại sao không dùng tool khác?  │
+│────────────────────────│──────────────────│────────────────────────────────│
+│ Giả lập user thật      │ k6               │ Viết script JS, dễ test OAuth  │
+│ Lưu số liệu k6 theo thời gian │ InfluxDB │ Time-series DB, ghi nhanh      │
+│ Thu thập số liệu API   │ Prometheus       │ Pull model, giữ lịch sử        │
+│ Vẽ đồ thị tất cả       │ Grafana          │ Đọc được cả 2 nguồn trên       │
+│ Theo dõi container     │ cAdvisor         │ Tự động, không cần config      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. k6 — Công cụ giả lập user
+
+### k6 là gì?
+
+k6 là **load testing tool** — nó giả lập hàng nghìn user thật cùng lúc gửi request đến API của bạn. Mỗi "user giả" gọi là **VU (Virtual User)**.
+
+```
+k6
+ ├── Đọc script load-test.js
+ ├── Tạo 1000 VU (goroutine), mỗi VU chạy vòng lặp:
+ │     1. Login → lấy token
+ │     2. GET /api/products
+ │     3. POST /api/orders
+ │     4. Nghỉ 2–5 giây
+ │     5. Lặp lại
+ └── Ghi kết quả vào terminal + InfluxDB
+```
+
+### Tại sao dùng k6 thay vì JMeter, Locust, ab?
+
+| Tool | Ngôn ngữ script | OAuth 2.0 support | Docker-friendly | Tích hợp Grafana |
+|---|---|---|---|---|
+| **k6** | JavaScript | Tốt (viết flow tùy ý) | Tốt | Native |
+| JMeter | XML (GUI) | Phức tạp | Nặng | Cần plugin |
+| Locust | Python | Tốt | Tốt | Cần plugin |
+| `ab` / `wrk` | Command line | Không có | Tốt | Không |
+
+> k6 phù hợp với dự án này vì: OAuth 2.0 flow phức tạp (login → lấy token → gắn header → gọi API) — chỉ cần viết JS bình thường.
+
+### Nhược điểm k6
+
+- **Single machine**: 1 instance k6 chỉ tạo được ~10.000 VU (tùy RAM). Muốn test 1 triệu VU cần dùng **k6 Cloud** hoặc distributed mode.
+- **Stateless by default**: Mỗi iteration mặc định login lại — tốn tài nguyên nếu token sống lâu. Cần tự cache token nếu muốn tối ưu.
+- **Không có browser**: k6 gửi HTTP thuần, không render JavaScript. Để test SPA (Angular) cần dùng **k6 Browser extension**.
+
+---
+
+## 2. InfluxDB — Nơi k6 lưu kết quả
+
+### InfluxDB là gì?
+
+InfluxDB là **time-series database** — database chuyên lưu dữ liệu dạng `(timestamp, metric_name, value)`. Khác với SQL Server lưu "bảng thực thể", InfluxDB lưu "sự kiện theo thời gian".
+
+```
+SQL Server:
+  Orders(Id, UserId, Amount, CreatedAt)  ← cấu trúc thực thể
+
+InfluxDB:
+  http_req_duration, timestamp=14:30:01.234, value=234ms, tags={route="/api/orders"}
+  http_req_duration, timestamp=14:30:01.456, value=189ms, tags={route="/api/products"}
+  http_req_duration, timestamp=14:30:01.789, value=5200ms, tags={route="/api/orders"}
+  ← mỗi request là 1 điểm dữ liệu, không có schema cứng
+```
+
+### Tại sao không dùng SQL Server để lưu kết quả k6?
+
+Trong 1 load test với 1000 VU chạy 13 phút:
+- k6 ghi **~80.000 data points/giây** vào InfluxDB
+- SQL Server không thể handle INSERT liên tục như vậy mà không bị lock
+- InfluxDB được tối ưu cho write liên tục, tự tổng hợp theo thời gian (downsampling)
+
+### Tại sao dùng InfluxDB 1.8 mà không phải 2.x?
+
+InfluxDB 2.x thay đổi API hoàn toàn (dùng Flux query language thay SQL-like). k6 hỗ trợ InfluxDB 1.x natively qua `--out influxdb=...`. InfluxDB 2.x cần cấu hình thêm.
+
+### InfluxDB 1.8 KHÔNG có Web UI
+
+> Đây là điểm gây nhầm lẫn phổ biến nhất.
+
+```
+http://localhost:8086/        → 404 page not found  ← ĐÚNG, không có UI
+http://localhost:8086/ping    → HTTP 204 (không có body)  ← verify healthy
+http://localhost:8086/query   → API endpoint để query data
+```
+
+InfluxDB 2.x mới có UI tại port 8086. Để xem data từ InfluxDB 1.8 → dùng **Grafana** (datasource InfluxDB).
+
+### Nhược điểm InfluxDB
+
+- **Không phải general-purpose DB**: Không dùng để lưu user, order. Chỉ dùng cho metrics/events.
+- **InfluxDB 1.8 đã EOL** (end of life): Vẫn dùng được nhưng không còn nhận bản vá bảo mật. Dùng được cho lab/học tập.
+- **Disk tăng nhanh**: 1 load test 13 phút có thể ghi vài trăm MB. Cần cấu hình retention policy.
+
+---
+
+## 3. Prometheus — Thu thập số liệu từ API
+
+### Prometheus là gì?
+
+Prometheus là **monitoring system** hoạt động theo mô hình **pull**: cứ mỗi N giây (cấu hình 5s trong project này), nó gửi `GET /metrics` đến API và lưu lại số liệu.
+
+```
+Mỗi 5 giây:
+  Prometheus → GET http://host.docker.internal:5000/metrics
+  API trả về:
+    http_requests_received_total{code="200",method="GET"} 12450
+    http_request_duration_seconds_bucket{le="0.1"} 8230
+    process_cpu_seconds_total 45.23
+    dotnet_gc_collections_total{generation="0"} 234
+    ...
+  Prometheus lưu vào local storage (TSDB)
+```
+
+### Khác gì InfluxDB?
+
+| | Prometheus | InfluxDB (với k6) |
+|---|---|---|
+| **Ai ghi?** | Prometheus tự đi lấy (pull) | k6 chủ động ghi vào (push) |
+| **Lưu gì?** | Số liệu hệ thống: CPU, request count, GC | Kết quả từng request của k6 |
+| **Query language** | PromQL | InfluxQL (SQL-like) |
+| **Retention** | Mặc định 15 ngày | Cấu hình theo database |
+
+### Tại sao dùng pull thay vì push?
+
+Mô hình **pull** có lợi thế: nếu service chết, Prometheus biết ngay (target = DOWN). Nếu service push thì Prometheus không biết khi nào service ngừng push vì timeout hay vì đang idle.
+
+### Prometheus Web UI — dùng để làm gì?
+
+Vào `http://localhost:9090`:
+
+```
+Status → Targets:    Xem target nào đang UP/DOWN
+Graph:               Gõ PromQL để xem metric bất kỳ
+  Ví dụ: rate(http_requests_received_total[1m])  → req/s trong 1 phút qua
+         process_cpu_seconds_total               → tổng CPU đã dùng
+         go_memstats_heap_inuse_bytes            → heap đang dùng
+```
+
+> Prometheus UI chỉ dùng để debug/kiểm tra nhanh. Để xem đẹp → dùng Grafana.
+
+### Nhược điểm Prometheus
+
+- **Long-term storage kém**: Mặc định giữ 15 ngày, sau đó xóa. Cần Thanos/Cortex cho production dài hạn.
+- **Pull model**: Prometheus phải reach được target. Nếu API ở trong private network không expose `/metrics` ra ngoài → không scrape được.
+- **Không alert real-time**: AlertManager tách riêng, cần cấu hình thêm.
+
+---
+
+## 4. Grafana — Trung tâm quan sát
+
+### Grafana là gì?
+
+Grafana là **visualization platform** — nó **không lưu data**, chỉ đọc từ nhiều nguồn rồi vẽ đồ thị. Trong project này nó đọc từ 2 nguồn:
+
+```
+Grafana
+  ├── Datasource: Prometheus  → vẽ dashboard .NET API (CPU, latency, GC)
+  └── Datasource: InfluxDB    → vẽ dashboard k6 (VU, error rate, response time)
+```
+
+### Tại sao cần Grafana khi Prometheus đã có UI?
+
+Prometheus UI chỉ vẽ được 1 metric mỗi lần, không lưu layout, không alert đẹp. Grafana:
+- Vẽ **nhiều metric cùng lúc** trên 1 dashboard
+- Lưu dashboard để dùng lại
+- Đọc được cả Prometheus lẫn InfluxDB trên **cùng 1 màn hình**
+- Dashboard ID 2587 (k6) + 10915 (.NET) cho phép thấy: "lúc k6 tăng lên 500 VU thì GC của .NET tăng bao nhiêu" — correlation giữa 2 datasource
+
+### Nhược điểm Grafana
+
+- **Không lưu data**: Mất Prometheus hoặc InfluxDB → mất data, Grafana chỉ là UI.
+- **Dashboard community chất lượng không đều**: Dashboard ID trên Grafana.com do cộng đồng đóng góp, có thể không match chính xác metric name của version bạn dùng. Khi import bị trống → cần chỉnh PromQL query trong panel.
+
+---
+
+## 5. cAdvisor — Giám sát Docker container
+
+### cAdvisor là gì?
+
+cAdvisor (Container Advisor) là tool của Google, chạy trong container, **tự động phát hiện và thu thập metrics của tất cả container Docker** trên cùng host.
+
+```
+cAdvisor (đang chạy trong container)
+  ├── Đọc /proc, /sys của host → lấy CPU, RAM, network I/O
+  ├── Đọc Docker API → biết tên container, image, labels
+  └── Expose tại :8080/metrics → Prometheus scrape
+```
+
+### Tại sao không dùng `docker stats`?
+
+`docker stats` chỉ xem real-time trên terminal, không lưu lịch sử, không vẽ đồ thị. cAdvisor:
+- Tự động expose Prometheus metrics
+- Lưu lịch sử qua Prometheus
+- Hiện thị trong Grafana dashboard ID 893
+
+### Hạn chế của cAdvisor trong project này
+
+> **Quan trọng:** cAdvisor chỉ theo dõi **container**, không theo dõi process chạy trực tiếp trên host.
+
+Vì API (`dotnet run`) chạy **ngoài Docker**, cAdvisor **không thấy** nó. Để xem CPU/RAM của .NET API:
+- Dùng Grafana dashboard ID 10915 (đọc từ Prometheus → `process_cpu_seconds_total`)
+- Hoặc `docker stats` nếu API chạy trong container
+
+### Nhược điểm cAdvisor
+
+- **Chỉ có ý nghĩa khi app chạy trong Docker**: Trong setup hiện tại (API chạy `dotnet run` ngoài Docker), cAdvisor chỉ theo dõi Prometheus, Grafana, InfluxDB — những thứ nhẹ, không phải điểm cần quan tâm.
+- **Privileged access**: Cần mount `/`, `/sys`, `/var/run` → security concern trong production.
+
+---
+
+## 6. Tổng hợp — Khi nào dùng cái nào?
+
+```
+Câu hỏi                                      │ Tool
+─────────────────────────────────────────────│──────────────────────────────
+"API đang xử lý bao nhiêu req/s?"            │ Grafana (ID 10915) ← Prometheus
+"p95 latency của /api/orders là bao nhiêu?"  │ Grafana (ID 10915) ← Prometheus
+"k6 đang có bao nhiêu VU, error rate?"      │ Grafana (ID 2587)  ← InfluxDB
+"Container nào đang ăn nhiều RAM nhất?"      │ Grafana (ID 893)   ← cAdvisor
+"Prometheus có đang scrape API không?"       │ localhost:9090 → Status → Targets
+"InfluxDB có đang sống không?"               │ curl localhost:8086/ping → 204
+"Tôi muốn test với 500 user trong 5 phút"   │ k6 (chỉnh stages trong load-test.js)
+"Tôi muốn xem query SQL nào đang chậm"      │ SSMS → Query 1 (sys.dm_exec_requests)
+```
+
+### Sơ đồ data flow đầy đủ
+
+```
+[k6]──────push──────► [InfluxDB :8086]
+                              │
+                              ▼
+[.NET API :5000]     [Grafana :3000]◄──query──[Prometheus :9090]
+    │   GET /metrics          │                       │
+    │◄────────────────────────│            scrape mỗi 5s
+    │                         │                       │
+    └─────────────────────────┘         [cAdvisor :8080]
+                                               │
+                                        expose /metrics
+                                        cho Prometheus
+```
+
+### Có thể bỏ bớt tool không?
+
+| Bỏ tool | Hậu quả |
+|---|---|
+| Bỏ InfluxDB | Không xem kết quả k6 real-time trên Grafana. Vẫn xem được trên terminal. |
+| Bỏ Prometheus | Không theo dõi .NET API metrics. Chỉ xem kết quả k6. |
+| Bỏ cAdvisor | Không xem metrics Docker container. Vẫn xem được API qua Prometheus. |
+| Bỏ Grafana | Phải đọc terminal k6 + Prometheus UI riêng lẻ, không có dashboard tổng hợp. |
+| **Tối thiểu để học** | k6 + terminal là đủ để thấy system fail. Các tool còn lại giúp hiểu *tại sao* fail. |
