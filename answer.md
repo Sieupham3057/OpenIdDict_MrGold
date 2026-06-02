@@ -1,5 +1,40 @@
 # Trả lời câu hỏi về Load Testing & Monitoring
 
+## Mục lục
+
+**[Phần 1 — Hỏi & Đáp](#trả-lời-câu-hỏi-về-load-testing--monitoring)**
+- [1. Server specs phục vụ được bao nhiêu concurrent user?](#1-server-specs-này-phục-vụ-được-bao-nhiêu-concurrent-user)
+- [2. Có nên tạo thêm table Product, Category, Order?](#2-có-nên-tạo-thêm-table-product-category-order-không)
+- [3. Giả lập hàng triệu user login + thao tác đồng thời](#3-giả-lập-hàng-triệu-user-login--thao-tác-đồng-thời)
+- [4. Monitoring hệ thống](#4-monitoring-hệ-thống)
+- [Tóm tắt roadmap thực hành](#tóm-tắt-roadmap-thực-hành)
+
+**[Phần 2 — Thực hành: Chạy và Đọc Monitoring](#phần-2--thực-hành-chạy-và-đọc-monitoring-step-by-step)**
+- [Kiến trúc tổng quan](#kiến-trúc-tổng-quan--các-thành-phần-liên-kết-với-nhau-như-thế-nào)
+- [Bước 1 — Khởi động toàn bộ stack](#bước-1--khởi-động-toàn-bộ-stack-api--monitoring)
+- [Bước 2 — Verify API hoạt động đúng](#bước-2--verify-api-hoạt-động-đúng)
+- [Bước 3 — Cấu hình Grafana](#bước-3--cấu-hình-grafana-làm-1-lần-duy-nhất)
+- [Bước 4 — Chạy k6 từng giai đoạn](#bước-4--chạy-k6-từng-giai-đoạn)
+  - [4.1 Smoke Test](#41-smoke-test--2-phút-2-vu-luôn-chạy-đầu-tiên)
+  - [4.2 Load Test](#42-load-test--tải-bình-thường-13-phút)
+  - [4.3 Stress Test](#43-stress-test--tìm-giới-hạn-manual)
+  - [4.4 Spike Test](#44-spike-test--flash-sale-simulation-manual)
+- [Bước 5 — Đọc Output k6 Terminal](#bước-5--đọc-output-k6-terminal)
+- [Bước 6 — Đọc Grafana Dashboard](#bước-6--đọc-grafana-dashboard)
+- [Bước 7 — Theo dõi SQL Server](#bước-7--theo-dõi-sql-server-trong-lúc-test)
+- [Bước 8 — Quy trình phân tích vấn đề](#bước-8--quy-trình-phân-tích-khi-thấy-vấn-đề)
+
+**[Phần 3 — Hiểu Từng Thành Phần](#phần-3--hiểu-từng-thành-phần-trong-hệ-thống)**
+- [Tại sao cần nhiều tool?](#tại-sao-lại-cần-nhiều-tool-như-vậy)
+- [1. k6 — Giả lập user](#1-k6--công-cụ-giả-lập-user)
+- [2. InfluxDB — Lưu kết quả k6](#2-influxdb--nơi-k6-lưu-kết-quả)
+- [3. Prometheus — Thu thập metrics](#3-prometheus--thu-thập-số-liệu-từ-api)
+- [4. Grafana — Visualize](#4-grafana--trung-tâm-quan-sát)
+- [5. cAdvisor — Giám sát container](#5-cadvisor--giám-sát-docker-container)
+- [6. Tổng hợp — Khi nào dùng cái nào](#6-tổng-hợp--khi-nào-dùng-cái-nào)
+
+---
+
 ## 1. Server specs này phục vụ được bao nhiêu concurrent user?
 
 ### Phân tích cấu hình
