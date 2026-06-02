@@ -43,6 +43,10 @@
 - [Workflow thực tế](#workflow-thực-tế)
 
 **[Phần 5 — OpenIddict Certificate trong Docker: Nguyên nhân lỗi & Fix chuẩn](#phần-5--openiddict-certificate-trong-docker-nguyên-nhân-lỗi--fix-chuẩn)**
+- [Ephemeral là gì?](#ephemeral-là-gì)
+- [Cách dùng hiện tại có đúng cho production không?](#cách-dùng-hiện-tại-có-đúng-cho-production-không)
+  - [3 vấn đề của Ephemeral trong production](#3-vấn-đề-của-ephemeral-trong-production)
+  - [Dự án thiếu gì để production-ready?](#dự-án-thiếu-gì-để-production-ready)
 - [Chuỗi nguyên nhân từng bước](#chuỗi-nguyên-nhân-từng-bước)
   - [Bước 1: ASPNETCORE_ENVIRONMENT dẫn code vào nhánh nào?](#bước-1-aspnetcore_environment-dẫn-code-vào-nhánh-nào)
   - [Bước 2: AddDevelopmentEncryptionCertificate làm gì bên trong?](#bước-2-adddevelopmentencryptioncertificate-làm-gì-bên-trong)
@@ -1366,6 +1370,119 @@ docker logs api --tail 30
 # PHẦN 5 — OpenIddict Certificate trong Docker: Nguyên nhân lỗi & Fix chuẩn
 
 > Lỗi: `Access to the path '/home/appuser' is denied` khi container `api` khởi động với `ASPNETCORE_ENVIRONMENT=Production`.
+
+---
+
+## Ephemeral là gì?
+
+**"Ephemeral"** = **tạm thời, chỉ sống trong lúc process đang chạy, mất khi process tắt.**
+
+Hình dung như RAM vs đĩa cứng: dữ liệu trong RAM mất khi tắt nguồn, dữ liệu trên đĩa còn mãi.
+
+```
+Ephemeral key:
+  Container khởi động → .NET sinh key ngẫu nhiên → giữ trong RAM
+  Container bị kill   → RAM bị xóa → key mất vĩnh viễn
+  Container khởi động lại → .NET sinh key MỚI hoàn toàn khác
+
+Persistent key (cert file):
+  Container khởi động → .NET đọc file openiddict.pfx → lấy key → giữ trong RAM
+  Container bị kill   → RAM bị xóa, nhưng file .pfx vẫn còn trên đĩa
+  Container khởi động lại → .NET đọc lại cùng file → cùng key cũ
+```
+
+Ephemeral key và Persistent key đều ký token như nhau trong lúc đang chạy. Sự khác biệt **chỉ xuất hiện sau khi restart**.
+
+---
+
+## Cách dùng hiện tại có đúng cho production không?
+
+**Code đang dùng (sau khi fix):**
+
+```csharp
+else  // Production — ASPNETCORE_ENVIRONMENT != Development
+{
+    var certPath = configuration["OpenIddict:CertPath"];
+
+    if (!string.IsNullOrEmpty(certPath) && File.Exists(certPath))
+    {
+        // Đường dẫn A: có cert file → dùng persistent key ← ĐÚNG cho production thật
+        var cert = new X509Certificate2(certPath, certPassword, ...EphemeralKeySet);
+        options.AddEncryptionCertificate(cert).AddSigningCertificate(cert);
+    }
+    else
+    {
+        // Đường dẫn B: không có cert file → dùng Ephemeral làm fallback ← Hiện tại đang đây
+        options.AddEphemeralEncryptionKey().AddEphemeralSigningKey();
+    }
+}
+```
+
+Docker Compose hiện tại **không mount cert file và không set `OpenIddict__CertPath`** → code luôn đi vào đường dẫn B → luôn dùng Ephemeral.
+
+**Đánh giá:**
+
+| Môi trường | Đánh giá | Lý do |
+|---|---|---|
+| Lab / staging (dự án này) | ✅ Hoàn toàn ổn | k6 login lại từ đầu mỗi lần test, không có user thật |
+| Production có user thật | ❌ Không ổn | 3 vấn đề nghiêm trọng bên dưới |
+
+### 3 vấn đề của Ephemeral trong production
+
+**Vấn đề 1 — User bị logout đồng loạt mỗi lần deploy:**
+
+```
+14:00 — bạn push code mới, chạy docker compose up → container restart → key mới sinh
+14:00 — 500 user đang dùng app → access token của họ được ký bằng key cũ
+14:00 — API validate token bằng key mới → key mới ≠ key cũ → 401 Unauthorized
+14:00 — Tất cả 500 user nhận thông báo "Phiên đăng nhập hết hạn, vui lòng đăng nhập lại"
+       → User tức giận → support ticket tăng vọt
+```
+
+**Vấn đề 2 — Không scale được sang nhiều instance:**
+
+Khi chạy 3 instance API sau load balancer:
+
+```
+Instance 1 khởi động → sinh key A
+Instance 2 khởi động → sinh key B  (khác key A)
+Instance 3 khởi động → sinh key C  (khác A và B)
+
+User gửi request:
+  Request 1 → Instance 1 → login OK → token được ký bằng key A
+  Request 2 → Instance 2 → validate token → dùng key B để verify → FAIL → 401
+  Request 3 → Instance 3 → validate token → dùng key C để verify → FAIL → 401
+
+Kết quả: user login thành công nhưng 2/3 request tiếp theo bị 401
+→ Lỗi ngẫu nhiên, không tái hiện được, cực kỳ khó debug
+```
+
+**Vấn đề 3 — Không audit được khi có incident bảo mật:**
+
+Trong production, khi phát hiện token bị giả mạo hoặc rò rỉ, cần biết "token này được ký bằng key nào, lúc nào, có cần revoke không". Ephemeral key không có lịch sử — không audit được.
+
+### Dự án thiếu gì để production-ready?
+
+Logic code đã đúng — có cả 2 đường dẫn. Chỉ cần bổ sung **2 bước config** (không phải thay đổi code):
+
+**Bước 1** — Tạo cert file (1 lần duy nhất):
+```bash
+cd docker
+chmod +x create-certs.sh && ./create-certs.sh
+```
+
+**Bước 2** — Thêm vào docker-compose:
+```yaml
+services:
+  api:
+    volumes:
+      - ./certs/openiddict.pfx:/app/certs/openiddict.pfx:ro
+    environment:
+      - OpenIddict__CertPath=/app/certs/openiddict.pfx
+      - OpenIddict__CertPassword=YourPassword
+```
+
+Sau khi rebuild → code tự chuyển sang đường dẫn A (cert file) thay vì fallback Ephemeral.
 
 ---
 
