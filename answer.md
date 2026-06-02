@@ -584,6 +584,101 @@ curl -X POST http://192.168.1.35:5000/connect/token \
 
 ---
 
+### 3.4 Tìm dashboard sau khi import & xem ngay không cần k6
+
+**Sau khi import, dashboard xuất hiện ở đâu?**
+
+Vào **Dashboards** (sidebar trái) → danh sách giờ có 3 dashboard vừa import. Click tên để mở.
+
+```
+Dashboards
+  ├── k6 Load Testing Results          ← ID 2587, datasource InfluxDB
+  ├── ASP.NET Core & Controllers       ← ID 10915, datasource Prometheus
+  └── Docker and OS metrics            ← ID 893, datasource Prometheus
+```
+
+---
+
+#### Dashboard 893 — Docker and OS metrics (xem được ngay)
+
+> Datasource Prometheus + cAdvisor → **không cần chạy k6**, data có sẵn từ lúc container start.
+
+Mở dashboard → góc trên phải chọn time range **Last 1 hour** → thấy ngay số liệu.
+
+**Các panel quan trọng:**
+
+| Panel | Ý nghĩa | Ngưỡng cần chú ý |
+|---|---|---|
+| **CPU Usage** | % CPU từng container | `api` > 80% liên tục → bottleneck |
+| **Memory Usage** | RAM từng container | `api` tăng liên tục không giảm → memory leak |
+| **Network I/O** | Bytes gửi/nhận | Tăng đột biến khi k6 chạy là bình thường |
+| **Container uptime** | Container có restart không | Restart giữa test → crash |
+
+Lọc theo container: tìm dropdown **container** ở đầu trang → chọn `api` để chỉ xem API container.
+
+---
+
+#### Dashboard 10915 — ASP.NET Core & Controllers (xem được ngay)
+
+> Datasource Prometheus → data có sẵn từ lúc api container start.
+
+**Các panel quan trọng:**
+
+| Panel | Ý nghĩa | Ngưỡng cần chú ý |
+|---|---|---|
+| **Request Rate** | Số request/giây vào API | Baseline ~0 khi chưa có traffic |
+| **Request Duration (p95)** | 95% request hoàn thành trong bao lâu | < 500ms = tốt, > 2s = có vấn đề |
+| **Error Rate** | Tỷ lệ request lỗi (4xx, 5xx) | Phải = 0% khi idle |
+| **GC Collections** | Số lần .NET Garbage Collector chạy | Gen2 tăng liên tục → memory pressure |
+| **Active Requests** | Request đang xử lý đồng thời | > 100 khi không có test → leak |
+| **Heap Size** | Bộ nhớ .NET heap đang dùng | Tăng không ngừng sau GC → memory leak |
+
+> Nếu panel hiện "No data" → datasource chưa đúng. Click tên panel → Edit → kiểm tra datasource đang chọn là Prometheus chưa.
+
+---
+
+#### Dashboard 2587 — k6 Load Testing Results (chỉ có data khi k6 đang chạy)
+
+> Datasource InfluxDB → **panel trống là bình thường** khi chưa chạy k6.
+
+Khi k6 chạy với `--out influxdb=http://192.168.1.35:8086/k6`, dashboard này tự cập nhật real-time.
+
+**Các panel quan trọng:**
+
+| Panel | Ý nghĩa | Ngưỡng cần chú ý |
+|---|---|---|
+| **Virtual Users** | Số VU đang chạy | Theo đúng stages trong script |
+| **Request Rate** | Số request/giây k6 gửi đi | |
+| **Response Time (p95)** | ⭐ **Quan trọng nhất** — p95 latency | < 500ms = pass, > 3s = fail |
+| **Request Failed %** | Tỷ lệ request k6 đánh dấu fail | Phải = 0% ở smoke/load test |
+| **Checks** | Các assertion trong script pass bao nhiêu % | 100% = hệ thống trả đúng dữ liệu |
+| **HTTP Request Duration** | Phân phối thời gian response | Đuôi dài (p99 >> p95) → có slow outlier |
+
+**Cách xem real-time khi k6 đang chạy:**
+- Góc trên phải → time range: **Last 5 minutes**
+- Bật **Auto refresh: 5s** (icon đồng hồ cạnh time range)
+
+---
+
+#### Workflow đọc dashboard khi load test đang chạy
+
+```
+Mở 3 tab browser song song:
+
+Tab 1 — k6 terminal     Xem progress, số liệu tổng từ k6
+Tab 2 — Dashboard 2587  Xem latency và error rate theo thời gian
+Tab 3 — Dashboard 10915 Xem .NET CPU, GC, heap — correlate với latency
+
+Khi thấy p95 latency tăng trên dashboard 2587:
+→ Chuyển sang dashboard 10915
+→ Xem GC Collections, Heap Size, CPU có tăng đồng thời không
+→ Nếu GC Gen2 tăng đúng lúc latency tăng → GC pressure là nguyên nhân
+→ Nếu CPU lên 100% → CPU bottleneck
+→ Nếu CPU thấp, GC bình thường nhưng latency cao → SQL Server bottleneck
+```
+
+---
+
 ## Bước 4 — Chạy k6 từng giai đoạn
 
 > Luôn chạy theo thứ tự: **Smoke → Load → Stress → Spike**. Không nhảy thẳng lên Stress.
