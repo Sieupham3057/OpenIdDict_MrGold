@@ -1,0 +1,59 @@
+# ============================================================
+# .dockerignore — giảm Docker build context, tăng tốc build
+# ============================================================
+
+# Git
+.git/
+.gitignore
+
+# .NET build artifacts
+**/bin/
+**/obj/
+**/publish/
+**/out/
+
+# Logs
+**/logs/
+**/*.log
+
+# Secrets (không đưa vào image)
+**/appsettings.Development.json
+**/appsettings.Production.json
+**/appsettings.Staging.json
+**/*.pfx
+**/*.p12
+**/*.pem
+**/*.key
+**/*.cer
+
+# Angular / Node (không cần trong .NET Docker build)
+auth-demo/
+**/node_modules/
+**/dist/
+**/.angular/
+
+# IDE & Editor
+.vs/
+.vscode/
+.idea/
+**/*.user
+**/*.suo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docs (không cần trong image)
+*.md
+DOCS/
+SCENARIO-BASED/
+
+# Test results
+**/TestResults/
+**/coverage/
+
+# Misc
+.env
+.env.*
+**/.dockerignore

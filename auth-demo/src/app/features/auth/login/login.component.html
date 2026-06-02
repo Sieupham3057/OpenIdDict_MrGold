@@ -1,0 +1,62 @@
+<div class="login-wrapper">
+  <div class="login-card">
+    <h2 class="login-title">Đăng nhập hệ thống</h2>
+
+    @if (errorMessage()) {
+      <div class="alert-error" role="alert">
+        {{ errorMessage() }}
+      </div>
+    }
+
+    <form [formGroup]="loginForm" (ngSubmit)="onSubmit()" novalidate>
+      <div class="form-group">
+        <label for="username">Tên đăng nhập / Email</label>
+        <input
+          id="username"
+          type="text"
+          formControlName="username"
+          autocomplete="username"
+          placeholder="Nhập username hoặc email"
+          [class.invalid]="usernameControl.invalid && usernameControl.touched"
+        />
+        @if (usernameControl.invalid && usernameControl.touched) {
+          <span class="error-text">
+            @if (usernameControl.errors?.['required']) { Vui lòng nhập username. }
+            @if (usernameControl.errors?.['minlength']) { Tối thiểu 3 ký tự. }
+          </span>
+        }
+      </div>
+
+      <div class="form-group">
+        <label for="password">Mật khẩu</label>
+        <input
+          id="password"
+          type="password"
+          formControlName="password"
+          autocomplete="current-password"
+          placeholder="Nhập mật khẩu"
+          [class.invalid]="passwordControl.invalid && passwordControl.touched"
+        />
+        @if (passwordControl.invalid && passwordControl.touched) {
+          <span class="error-text">
+            @if (passwordControl.errors?.['required']) { Vui lòng nhập mật khẩu. }
+            @if (passwordControl.errors?.['minlength']) { Tối thiểu 8 ký tự. }
+          </span>
+        }
+      </div>
+
+      <button type="submit" class="btn-login" [disabled]="isLoading()">
+        @if (isLoading()) {
+          Đang đăng nhập...
+        } @else {
+          Đăng nhập
+        }
+      </button>
+    </form>
+
+    <div class="security-note">
+      Token được lưu trong memory, không trong localStorage.
+      Refresh token nằm trong HttpOnly cookie (JS không đọc được).
+    </div>
+  </div>
+</div>

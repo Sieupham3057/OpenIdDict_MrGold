@@ -1,0 +1,103 @@
+# ============================================================
+# .NET
+# ============================================================
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+*.swp
+*.bak
+*.orig
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+
+# Publish output
+publish/
+out/
+
+# Entity Framework migrations (keep Migrations folder but ignore local snapshots)
+# Comment out if you want to commit migrations:
+# Migrations/
+
+# Logs
+logs/
+*.log
+
+# Secrets & appsettings môi trường cụ thể
+appsettings.Development.json
+appsettings.Production.json
+appsettings.Staging.json
+secrets.json
+*.pfx
+*.p12
+*.pem
+*.key
+*.cer
+
+# dotnet user-secrets
+.user-secrets/
+
+# Test results
+TestResults/
+coverage/
+*.trx
+*.coveragexml
+
+# ============================================================
+# Angular / Node
+# ============================================================
+auth-demo/node_modules/
+auth-demo/dist/
+auth-demo/.angular/
+auth-demo/tmp/
+auth-demo/out-tsc/
+
+npm-debug.log
+yarn-error.log
+.pnpm-debug.log
+
+# ============================================================
+# IDE & Editor
+# ============================================================
+.idea/
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.sublime-workspace
+*.code-workspace
+
+# ============================================================
+# OS
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ============================================================
+# Claude Code (personal AI assistant config)
+# ============================================================
+.claude/
+
+# ============================================================
+# Thư mục repo độc lập — không gộp vào
+# ============================================================
+SCENARIO-BASED/
+
+# ============================================================
+# Misc
+# ============================================================
+*.tmp
+*.temp
+.env
+.env.*
+!.env.example
