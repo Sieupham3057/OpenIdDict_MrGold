@@ -34,7 +34,7 @@ RUN apt-get update \
 # Tạo user non-root
 RUN groupadd -g 1001 appgroup \
     && useradd -u 1001 -g appgroup -s /usr/sbin/nologin appuser \
-    && mkdir -p /app/logs \
+    && mkdir -p /app/logs /app/certs \
     && chown -R appuser:appgroup /app
 
 # Copy application

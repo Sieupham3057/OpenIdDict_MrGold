@@ -31,7 +31,7 @@ try
 
     builder.Services.AddDatabase(builder.Configuration, builder.Environment);
     builder.Services.AddIdentityConfig();
-    builder.Services.AddOpenIddictConfig(builder.Environment);
+    builder.Services.AddOpenIddictConfig(builder.Environment, builder.Configuration);
     builder.Services.AddCorsConfig(builder.Configuration);
     builder.Services.AddAuthorizationConfig();
     builder.Services.AddSwaggerConfig();

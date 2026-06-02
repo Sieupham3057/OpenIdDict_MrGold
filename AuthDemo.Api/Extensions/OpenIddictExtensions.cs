@@ -1,11 +1,12 @@
 using AuthDemo.Api.Data;
+using System.Security.Cryptography.X509Certificates;
 
 namespace AuthDemo.Api.Extensions;
 
 public static class OpenIddictExtensions
 {
     public static IServiceCollection AddOpenIddictConfig(this IServiceCollection services,
-        IWebHostEnvironment environment)
+        IWebHostEnvironment environment, IConfiguration configuration)
     {
         services.AddOpenIddict()
             // === TẦNG 1: CORE ===
@@ -69,12 +70,26 @@ public static class OpenIddictExtensions
                 }
                 else
                 {
-                    // Production: dùng persistent certificate (lưu trong KeyVault, file .pfx...)
-                    // để token vẫn hợp lệ sau khi restart hoặc deploy nhiều instance
-                    // options.AddEncryptionCertificate(...)
-                    //        .AddSigningCertificate(...);
-                    options.AddDevelopmentEncryptionCertificate()
-                           .AddDevelopmentSigningCertificate();
+                    // Production: load certificate từ file .pfx được mount vào container
+                    // QUAN TRỌNG: dùng EphemeralKeySet để .NET KHÔNG cố ghi private key
+                    // vào OS keystore (~/.dotnet/...) — sẽ lỗi quyền trên non-root container Linux
+                    var certPath = configuration["OpenIddict:CertPath"];
+                    var certPassword = configuration["OpenIddict:CertPassword"] ?? string.Empty;
+
+                    if (!string.IsNullOrEmpty(certPath) && File.Exists(certPath))
+                    {
+                        var cert = new X509Certificate2(certPath, certPassword,
+                            X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.EphemeralKeySet);
+                        options.AddEncryptionCertificate(cert)
+                               .AddSigningCertificate(cert);
+                    }
+                    else
+                    {
+                        // Fallback khi chưa cấu hình cert (Docker lab / staging)
+                        // Token sẽ bị mất hiệu lực khi container restart — chấp nhận được cho môi trường test
+                        options.AddEphemeralEncryptionKey()
+                               .AddEphemeralSigningKey();
+                    }
                 }
 
                 // Tắt mã hóa nội dung access token — token sẽ ở dạng JWT thuần (base64)
