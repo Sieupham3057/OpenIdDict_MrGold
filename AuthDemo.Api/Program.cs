@@ -48,7 +48,8 @@ try
     if (app.Environment.IsDevelopment())
         app.UseSwaggerConfig();
 
-    app.UseHttpsRedirection();
+    if (!app.Environment.IsProduction())
+        app.UseHttpsRedirection();
     app.UseCors(CorsExtensions.PolicyName);
     app.UseMiddleware<RefreshTokenCookieMiddleware>();
     app.UseSecurityHeaders();
