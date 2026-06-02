@@ -570,7 +570,9 @@ curl -X POST http://192.168.1.35:5000/connect/token \
 
 ### 3.3 Import 3 dashboard có sẵn
 
-Vào **Dashboards → Import** và import lần lượt:
+1. Vào **Dashboards** (sidebar trái)
+2. Click nút **New ▾** (góc trên phải) → chọn **Import**
+3. Nhập Dashboard ID → **Load** → chọn datasource tương ứng → **Import**
 
 | Dashboard ID | Tên | Datasource | Dùng để xem |
 |---|---|---|---|
@@ -578,7 +580,7 @@ Vào **Dashboards → Import** và import lần lượt:
 | `10915` | ASP.NET Core & Controllers | Prometheus | .NET API metrics |
 | `893` | Docker and OS metrics | Prometheus | CPU/RAM container |
 
-> Cách import: nhập ID → **Load** → chọn datasource tương ứng → **Import**
+> ⚠️ Nút **Import** không hiển thị trực tiếp trên trang Dashboards — phải click **New ▾** trước rồi mới thấy Import trong dropdown.
 
 ---
 
