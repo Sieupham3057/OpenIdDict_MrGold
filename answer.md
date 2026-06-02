@@ -679,6 +679,244 @@ Khi thấy p95 latency tăng trên dashboard 2587:
 
 ---
 
+### 3.5 Tại sao dashboard hiện N/A — debug theo từng dashboard
+
+> **N/A** = panel query không trả về data. Mỗi dashboard có nguyên nhân khác nhau.
+
+---
+
+#### Dashboard 2587 — k6 Load Testing Results: N/A là bình thường
+
+**Nguyên nhân:** InfluxDB database `k6` chưa có data — k6 chưa chạy lần nào.
+
+```
+Dashboard 2587 chỉ có data khi k6 đang chạy với flag:
+--out influxdb=http://192.168.1.35:8086/k6
+
+Trước khi chạy k6 → tất cả panel đều "No data" / N/A → ĐÚNG, không phải lỗi.
+```
+
+→ **Bỏ qua dashboard này cho đến Bước 4.**
+
+---
+
+#### Dashboard 10915 — ASP.NET Core & Controllers: cần chọn Instance
+
+**Nguyên nhân:** Biến `Instances` ở đầu trang chưa được chọn — dashboard không biết lấy data từ instance nào.
+
+**Cách fix:**
+
+1. Nhìn đầu trang dashboard → thấy dropdown **Instances** đang trống hoặc có icon ⚠️
+2. Click vào dropdown **Instances** → chọn `api:8080`
+3. Dashboard tự load lại → panels hiện data
+
+> Nếu dropdown `Instances` trống (không có option nào):
+> - Prometheus chưa scrape được API → vào `http://192.168.1.35:9090` → Status → Targets
+> - Target `dotnet-api` phải là **UP** (màu xanh)
+> - Nếu DOWN → `docker logs api --tail 20` để xem API có lỗi không
+
+**Lưu ý thêm:** Dashboard này chỉ hiện data cho các Controller đã được gọi ít nhất 1 request. Nếu chưa gọi API nào → `Controllers` dropdown cũng trống. Thử gọi:
+
+```bash
+curl http://192.168.1.35:5000/health
+curl http://192.168.1.35:5000/metrics | head -5
+```
+
+Sau đó chờ 5-10 giây (scrape interval) → F5 lại dashboard.
+
+---
+
+#### Dashboard 893 — Docker and System Monitoring: thiếu node_exporter
+
+**Nguyên nhân:** Dashboard 893 yêu cầu **node_exporter** để lấy metrics hệ thống (CPU, RAM, Disk, Uptime của máy host). Setup hiện tại **không có node_exporter** — chỉ có cAdvisor.
+
+```
+prometheus.yml hiện tại có:
+  ✓ job: dotnet-api    → API metrics
+  ✓ job: cadvisor      → container metrics
+
+  ✗ job: node_exporter → system metrics (CPU host, RAM host, Disk) — THIẾU
+```
+
+Dashboard 893 dùng metric dạng `node_cpu_seconds_total`, `node_memory_*`, `node_filesystem_*` — các metric này chỉ có từ node_exporter. Không có node_exporter → toàn bộ N/A.
+
+**Giải pháp — thêm node_exporter vào docker-compose:**
+
+Mở `docker/docker-compose.yml`, thêm service:
+
+```yaml
+  node-exporter:
+    image: prom/node-exporter:latest
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    ports:
+      - "9100:9100"
+```
+
+Thêm vào `prometheus.yml`:
+
+```yaml
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+```
+
+Sau đó:
+
+```bash
+docker compose up -d node-exporter
+docker compose restart prometheus
+```
+
+Đợi 10 giây → F5 dashboard 893 → panels hiện data.
+
+---
+
+### 3.6 Percentile là gì? P50, P95, P99 — đọc như thế nào?
+
+#### Tại sao không dùng Average (trung bình)?
+
+```
+Scenario: 10 requests với response time (ms):
+  50, 55, 48, 52, 51, 49, 53, 47, 200, 1500
+
+Average = (50+55+48+52+51+49+53+47+200+1500) / 10 = 210ms
+
+Nhưng 8/10 user thực ra nhận được < 60ms.
+2 request bất thường (200ms, 1500ms) kéo average lên 210ms.
+→ Average nói "hệ thống chậm 210ms" trong khi 80% user thấy < 60ms.
+→ Average bị outlier bóp méo — không đáng tin.
+```
+
+**Percentile nói sự thật hơn:**
+
+```
+Sắp xếp 10 giá trị từ nhỏ đến lớn:
+  47, 48, 49, 50, 51, 52, 53, 55, 200, 1500
+
+P50 (median) = giá trị ở vị trí 50% = 51ms
+               → 50% user nhận < 51ms
+
+P90           = giá trị ở vị trí 90% = 200ms
+               → 90% user nhận < 200ms, 10% chậm hơn
+
+P95           = giá trị ở vị trí 95% = ~1500ms (với 10 điểm)
+               → 95% user nhận nhanh hơn mức này
+
+P99           = 99% user nhận nhanh hơn mức này
+               → Chỉ 1/100 user gặp trường hợp xấu nhất
+```
+
+---
+
+#### Bảng percentile thực tế
+
+| Percentile | Ý nghĩa | Dùng khi nào |
+|---|---|---|
+| **P50** (median) | Trải nghiệm của user "trung bình" — 50% nhanh hơn, 50% chậm hơn | Hiểu baseline |
+| **P75** | 75% user được serve nhanh hơn mức này | Ít dùng |
+| **P90** | 90% user được serve nhanh hơn | Ngưỡng cảnh báo sớm |
+| **P95** | ⭐ **Standard SLA** — 95% user được serve nhanh hơn | **Dùng nhiều nhất trong industry** |
+| **P99** | 99% user được serve nhanh hơn — đo "tail latency" | API quan trọng, payment, auth |
+| **P99.9** (P999) | 999/1000 user được serve nhanh hơn | High-scale: Netflix, Google, trading |
+| **P99.99** | 9999/10000 user nhanh hơn | Ultra high-scale: financial systems |
+
+---
+
+#### Trong thực tế dùng P bao nhiêu?
+
+**Startup / Web thông thường:**
+```
+P95 < 500ms  → Target SLA tiêu chuẩn
+P99 < 2s     → Dưới đây user vẫn chịu được
+
+Nếu P95 > 1s → có vấn đề nghiêm trọng cần điều tra
+```
+
+**E-commerce (checkout, thanh toán):**
+```
+P95 < 300ms  → Checkout chậm → cart abandonment tăng
+P99 < 1s     → Amazon research: mỗi 100ms chậm hơn = -1% revenue
+```
+
+**Auth / Login (như AuthDemo của bạn):**
+```
+P95 < 200ms  → Login nhanh, UX tốt
+P99 < 500ms  → Chấp nhận được
+P99 > 1s     → User nghĩ "app đơ" → đăng nhập lại
+```
+
+**Microservices (gọi nhau):**
+```
+P99 < 50ms   → Mỗi service chain 5 hop = 250ms tổng — OK
+P99 > 200ms  → Chain 5 hop = 1s tổng — quá chậm
+```
+
+**High-frequency trading / Real-time:**
+```
+P99.9 < 1ms  → Mọi microsecond quan trọng
+Dùng P99.9 hoặc P99.99 vì outlier = lost money
+```
+
+---
+
+#### Đọc percentile chart trên Grafana như thế nào?
+
+```
+Trục Y: response time (ms)
+Trục X: thời gian
+
+                P99 ────────────────── 850ms  ← 1% request chậm hơn đây
+                P95 ─────────────────  420ms  ← SLA line — theo dõi cái này
+                P90 ────────────────── 280ms
+                P50 ────────────────── 95ms   ← Trải nghiệm "bình thường"
+
+Khi load tăng (k6 tăng VU):
+  P50 tăng nhẹ: 95ms → 120ms       → bình thường, hệ thống chịu được
+  P95 tăng vừa: 420ms → 680ms      → cần chú ý
+  P99 tăng mạnh: 850ms → 3500ms    → có bottleneck — P99 luôn nhạy hơn P95
+```
+
+**"Long tail" — tại sao P99 quan trọng:**
+
+```
+P50 = 95ms, P95 = 420ms, P99 = 3500ms
+
+Khoảng cách P95→P99 rất lớn (420ms → 3500ms) = "long tail"
+→ Có một số request đặc biệt chậm (có thể: GC pause, DB lock, cold cache)
+→ Với 1000 user/phút: 10 user mỗi phút gặp 3.5s wait
+
+P50 = 95ms, P95 = 380ms, P99 = 450ms
+
+Khoảng cách P95→P99 nhỏ = "tight distribution" 
+→ Hệ thống consistent, ít outlier — tốt hơn nhiều
+```
+
+---
+
+#### Ngưỡng thực tế cho AuthDemo của bạn
+
+Khi chạy load test với 1000 VU, target:
+
+| Metric | Pass | Warning | Fail |
+|---|---|---|---|
+| **P95 response time** | < 500ms | 500ms–1s | > 1s |
+| **P99 response time** | < 2s | 2s–5s | > 5s |
+| **Error rate** | < 0.1% | 0.1%–1% | > 1% |
+| **P95 login** (`/connect/token`) | < 300ms | 300ms–800ms | > 800ms |
+| **P95 read** (`GET /products`) | < 200ms | 200ms–500ms | > 500ms |
+| **P95 write** (`POST /orders`) | < 500ms | 500ms–1.5s | > 1.5s |
+
+> k6 script đã có `thresholds` config — nếu vượt ngưỡng, k6 exit code != 0 và in ✗ thay vì ✓.
+
+---
+
 ## Bước 4 — Chạy k6 từng giai đoạn
 
 > Luôn chạy theo thứ tự: **Smoke → Load → Stress → Spike**. Không nhảy thẳng lên Stress.
