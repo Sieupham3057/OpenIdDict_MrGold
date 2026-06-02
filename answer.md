@@ -599,30 +599,41 @@ Dashboards
 
 ---
 
-#### Dashboard 893 — Docker and OS metrics (xem được ngay)
+#### Dashboard 893 — Docker and OS metrics: ⚠️ CẦN node_exporter (chưa có trong setup)
 
-> Datasource Prometheus + cAdvisor → **không cần chạy k6**, data có sẵn từ lúc container start.
+> Dashboard 893 dùng metric `node_*` từ **node_exporter** — **không phải** cAdvisor. Setup hiện tại chưa có node_exporter → toàn bộ N/A là đúng.
+>
+> Xem hướng dẫn thêm node_exporter ở **section 3.5** bên dưới.
 
-Mở dashboard → góc trên phải chọn time range **Last 1 hour** → thấy ngay số liệu.
-
-**Các panel quan trọng:**
+Sau khi thêm node_exporter, các panel sẽ hiện:
 
 | Panel | Ý nghĩa | Ngưỡng cần chú ý |
 |---|---|---|
-| **CPU Usage** | % CPU từng container | `api` > 80% liên tục → bottleneck |
-| **Memory Usage** | RAM từng container | `api` tăng liên tục không giảm → memory leak |
-| **Network I/O** | Bytes gửi/nhận | Tăng đột biến khi k6 chạy là bình thường |
-| **Container uptime** | Container có restart không | Restart giữa test → crash |
-
-Lọc theo container: tìm dropdown **container** ở đầu trang → chọn `api` để chỉ xem API container.
+| **CPU Usage** | % CPU máy host | > 80% liên tục → bottleneck |
+| **Memory Usage** | RAM máy host đang dùng | Tăng liên tục → leak |
+| **Disk space** | Dung lượng đĩa | > 80% → cần dọn |
+| **Network I/O** | Bytes gửi/nhận của host | Tăng khi k6 chạy là bình thường |
+| **Container uptime** | Container restart không | Restart giữa test → crash |
 
 ---
 
-#### Dashboard 10915 — ASP.NET Core & Controllers (xem được ngay)
+#### Dashboard 10915 — ASP.NET Core & Controllers: cần chọn Instance thủ công
 
-> Datasource Prometheus → data có sẵn từ lúc api container start.
+> Datasource Prometheus → data có sẵn **sau khi gọi ít nhất 1 request vào API** và **chọn đúng Instance**.
 
-**Các panel quan trọng:**
+**Bước bắt buộc trước khi xem:**
+
+```
+1. Mở dashboard 10915
+2. Đầu trang có 2 dropdown: [Instances ▾] [Controllers ▾]
+3. Click [Instances ▾] → chọn "api:8080"
+4. Dashboard tự reload → panels hiện data
+```
+
+> Nếu dropdown **Instances trống** (không có option nào) → Prometheus chưa scrape được API.
+> Kiểm tra: `http://192.168.1.35:9090` → Status → Targets → `dotnet-api` phải **UP** màu xanh.
+
+**Sau khi chọn Instance, các panel quan trọng:**
 
 | Panel | Ý nghĩa | Ngưỡng cần chú ý |
 |---|---|---|
@@ -633,7 +644,18 @@ Lọc theo container: tìm dropdown **container** ở đầu trang → chọn `a
 | **Active Requests** | Request đang xử lý đồng thời | > 100 khi không có test → leak |
 | **Heap Size** | Bộ nhớ .NET heap đang dùng | Tăng không ngừng sau GC → memory leak |
 
-> Nếu panel hiện "No data" → datasource chưa đúng. Click tên panel → Edit → kiểm tra datasource đang chọn là Prometheus chưa.
+**Verify nhanh Prometheus đang scrape đúng:**
+
+```bash
+# Kiểm tra API đang expose metrics
+curl http://192.168.1.35:5000/metrics | grep "^http_requests_received_total"
+
+# Kết quả mong đợi (sau khi đã gọi ít nhất 1 request):
+# http_requests_received_total{code="200",controller="...",method="GET"} 3
+# Nếu không ra dòng nào → UseHttpMetrics() chưa được gọi trong Program.cs
+```
+
+Vào `http://192.168.1.35:9090` → Graph → gõ `http_requests_received_total` → Execute → nếu thấy data = Prometheus đang scrape đúng → dashboard 10915 sẽ có data khi chọn Instance.
 
 ---
 
