@@ -45,7 +45,7 @@ try
     // CẤU HÌNH MIDDLEWARE PIPELINE
     // ═══════════════════════════════════════════════════════════════════════════════
 
-    if (app.Environment.IsDevelopment())
+    // if (app.Environment.IsDevelopment())
         app.UseSwaggerConfig();
 
     if (!app.Environment.IsProduction())
