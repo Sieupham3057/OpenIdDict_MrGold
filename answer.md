@@ -325,348 +325,269 @@ Bước 6: Lặp lại Bước 3–5
 
 ---
 
-# PHẦN 2 — Triển khai, Đọc Log và Monitoring (Step by Step)
+# PHẦN 2 — Thực hành: Chạy và Đọc Monitoring (Step by Step)
+
+> Tất cả code và cấu hình đã có sẵn. Phần này hướng dẫn **cách chạy**, **cách dùng từng tool**, và **cách đọc kết quả**.
 
 ---
 
-## Bước 1 — Chuẩn bị Monitoring Stack (Prometheus + Grafana + InfluxDB)
-
-### 1.1 Tạo cấu trúc thư mục
+## Kiến trúc tổng quan — Các thành phần liên kết với nhau như thế nào
 
 ```
-OpenIdDict/
-├── docker/
-│   ├── docker-compose.monitoring.yml
-│   ├── prometheus/
-│   │   └── prometheus.yml
-│   └── grafana/
-│       └── provisioning/     ← Grafana tự load datasource/dashboard
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          MÁY CỦA BẠN (host)                            │
+│                                                                         │
+│   ┌─────────────────┐          ┌──────────────────────────────────┐    │
+│   │  dotnet run     │          │         Docker Compose           │    │
+│   │  AuthDemo.Api   │◄─scrape──│  Prometheus (9090)               │    │
+│   │  :5000          │          │  Grafana    (3000) ◄─── bạn xem  │    │
+│   │  GET /metrics   │          │  InfluxDB   (8086) ◄─── k6 ghi   │    │
+│   │  GET /health    │          │  cAdvisor   (8080) ← monitor Docker│   │
+│   └─────────────────┘          └──────────────────────────────────┘    │
+│                                                                         │
+│   ┌─────────────────┐                                                   │
+│   │  k6 run         │──────────► POST /connect/token  (login)           │
+│   │  (load test)    │──────────► GET  /api/products   (đọc)             │
+│   │                 │──────────► POST /api/orders      (ghi)            │
+│   │                 │──ghi──────► InfluxDB :8086                        │
+│   └─────────────────┘                                                   │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Vai trò từng thành phần:**
+- **k6**: giả lập hàng trăm/nghìn user thật — login, đọc sản phẩm, tạo đơn hàng
+- **Prometheus**: cứ 5 giây lại "hỏi" API endpoint `/metrics` để lấy số liệu về CPU, request count, latency
+- **InfluxDB**: k6 đẩy kết quả test vào đây theo thời gian thực (time-series database)
+- **Grafana**: đọc cả Prometheus lẫn InfluxDB rồi vẽ đồ thị — bạn nhìn vào đây để hiểu hệ thống đang làm gì
+- **cAdvisor**: theo dõi Docker container (CPU/RAM của từng container, không phải của API)
+
+---
+
+## Bước 1 — Khởi động Monitoring Stack
+
+### 1.1 Chạy lệnh
 
 ```bash
-mkdir -p docker/prometheus docker/grafana/provisioning/datasources
-```
-
-### 1.2 Tạo `docker/prometheus/prometheus.yml`
-
-```yaml
-global:
-  scrape_interval: 5s        # Thu thập metrics mỗi 5 giây (mặc định 15s, giảm để xem real-time)
-  evaluation_interval: 5s
-
-scrape_configs:
-
-  # .NET API — expose qua endpoint /metrics (prometheus-net.AspNetCore)
-  - job_name: 'dotnet-api'
-    static_configs:
-      - targets: ['host.docker.internal:5000']   # Nếu API chạy trên host (không phải Docker)
-        # targets: ['api:8080']                   # Nếu API chạy trong Docker cùng network
-    metrics_path: '/metrics'
-
-  # cAdvisor — theo dõi CPU/RAM/disk của từng Docker container
-  - job_name: 'cadvisor'
-    static_configs:
-      - targets: ['cadvisor:8080']
-
-  # k6 — k6 tự expose metrics qua port 5665 khi dùng --out statsd hoặc xDash
-  # (dùng InfluxDB thay thế, xem phần k6 output bên dưới)
-```
-
-### 1.3 Tạo `docker/docker-compose.monitoring.yml`
-
-```yaml
-version: '3.8'
-
-services:
-
-  # ── Prometheus: Thu thập và lưu metrics theo dạng time-series ──────────────
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    ports:
-      - "9090:9090"           # Web UI: http://localhost:9090
-    volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.retention.time=7d'   # Giữ data 7 ngày
-    restart: unless-stopped
-
-  # ── Grafana: Visualize metrics từ Prometheus và InfluxDB ───────────────────
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    ports:
-      - "3000:3000"           # Web UI: http://localhost:3000
-    environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin123
-      - GF_USERS_ALLOW_SIGN_UP=false
-    volumes:
-      - grafana-data:/var/lib/grafana
-    depends_on:
-      - prometheus
-      - influxdb
-    restart: unless-stopped
-
-  # ── InfluxDB: Lưu kết quả k6 (time-series database) ───────────────────────
-  influxdb:
-    image: influxdb:1.8       # k6 hỗ trợ InfluxDB v1.x native
-    container_name: influxdb
-    ports:
-      - "8086:8086"
-    environment:
-      - INFLUXDB_DB=k6        # Database tự động tạo khi start
-      - INFLUXDB_HTTP_AUTH_ENABLED=false
-    volumes:
-      - influxdb-data:/var/lib/influxdb
-    restart: unless-stopped
-
-  # ── cAdvisor: Thu thập CPU/RAM/Network của Docker containers ──────────────
-  cadvisor:
-    image: gcr.io/cadvisor/cadvisor:latest
-    container_name: cadvisor
-    ports:
-      - "8080:8080"
-    volumes:
-      - /:/rootfs:ro
-      - /var/run:/var/run:ro
-      - /sys:/sys:ro
-      - /var/lib/docker/:/var/lib/docker:ro
-    restart: unless-stopped
-
-volumes:
-  prometheus-data:
-  grafana-data:
-  influxdb-data:
-```
-
-### 1.4 Khởi động monitoring stack
-
-```bash
-cd docker/
+# Đứng ở thư mục gốc project (e:\TECHLEAD_PROJECT\OpenIdDict)
+cd docker
 docker compose -f docker-compose.monitoring.yml up -d
+```
 
-# Kiểm tra tất cả container đang chạy
+> **`-d`** = detached mode, chạy ngầm, không chiếm terminal.
+
+### 1.2 Kiểm tra tất cả container đang sống
+
+```bash
 docker compose -f docker-compose.monitoring.yml ps
 ```
 
-Kết quả mong đợi:
+Kết quả phải thấy:
 ```
-NAME          STATUS
-prometheus    running (healthy)
-grafana       running (healthy)
-influxdb      running
-cadvisor      running
+NAME         STATUS
+prometheus   running
+grafana      running
+influxdb     running
+cadvisor     running
 ```
+
+Nếu có container `Exited` → xem log để debug:
+```bash
+docker logs prometheus   # thay tên container tương ứng
+```
+
+### 1.3 Verify từng service
+
+| Service | URL | Kỳ vọng |
+|---|---|---|
+| Prometheus | `http://localhost:9090` | Trang web UI hiện lên |
+| Grafana | `http://localhost:3000` | Login page (admin / admin123) |
+| InfluxDB | `http://localhost:8086/ping` | Trả về HTTP 204 (không có body) |
+| cAdvisor | `http://localhost:8080` | Dashboard container metrics |
 
 ---
 
-## Bước 2 — Cài Prometheus metrics vào .NET API
+## Bước 2 — Khởi động API và Verify
 
-### 2.1 Thêm package
-
-```bash
-cd AuthDemo.Api/
-dotnet add package prometheus-net.AspNetCore
-dotnet add package prometheus-net.DotNetRuntime   # Thêm GC, thread pool metrics
-```
-
-### 2.2 Cập nhật `Program.cs`
-
-```csharp
-using Prometheus;
-
-// ... sau builder.Build() ...
-
-// Khai báo metrics trước UseRouting
-app.UseRouting();
-
-app.UseHttpMetrics(options =>
-{
-    // Ghi lại method, status code, path (gộp path params → /api/products/{id})
-    options.AddCustomLabel("version", _ => "v1");
-});
-
-// DotNetRuntime metrics: GC, thread pool, exception rate
-DotNetRuntimeStatsCollector.StartCollection();
-
-// Expose /metrics endpoint — Prometheus sẽ scrape endpoint này
-app.MapMetrics();  // Default: GET /metrics
-
-// Health check endpoint — k6 dùng để verify API online trước khi test
-app.MapHealthChecks("/health");
-```
-
-### 2.3 Verify endpoint hoạt động
+### 2.1 Chạy API
 
 ```bash
-# Sau khi chạy API
-curl http://localhost:5000/metrics | head -30
-```
-
-Output mẫu:
-```
-# HELP http_requests_received_total Total HTTP requests received
-# TYPE http_requests_received_total counter
-http_requests_received_total{code="200",method="GET",controller="Products"} 1250
-http_requests_received_total{code="201",method="POST",controller="Orders"} 342
-...
-# HELP process_cpu_seconds_total Total user and system CPU time
-process_cpu_seconds_total 45.23
-```
-
----
-
-## Bước 3 — Seed dữ liệu và kiểm tra API sẵn sàng
-
-### 3.1 Khởi động API (tự seed users)
-
-```bash
-cd AuthDemo.Api/
+# Mở terminal mới, đứng ở thư mục gốc
+cd AuthDemo.Api
 dotnet run
 ```
 
-Chờ thấy log:
+Chờ thấy 2 dòng log quan trọng:
 ```
-[INF] Đã tạo 100 test users cho k6 load testing
+[INF] Đã tạo 100 test users cho k6 load testing   ← WorkerService seed xong
 [INF] Application started. Press Ctrl+C to shut down.
 ```
 
-### 3.2 Seed thêm Categories và Products (chạy script SQL)
+> WorkerService tự động seed 100 user vào DB khi app khởi động. Không cần chạy script SQL thủ công.
 
-Tạo file `seed-data.sql` và chạy trên SQL Server:
-
-```sql
--- Seed 5 categories
-INSERT INTO Categories (Name, Description, IsActive, CreatedAt) VALUES
-('Điện thoại',     'Smartphone các loại', 1, GETUTCDATE()),
-('Laptop',         'Máy tính xách tay',   1, GETUTCDATE()),
-('Phụ kiện',       'Tai nghe, sạc, ốp',   1, GETUTCDATE()),
-('Máy tính bảng',  'iPad, Android tablet', 1, GETUTCDATE()),
-('Đồng hồ thông minh', 'Smartwatch',      1, GETUTCDATE());
-
--- Seed 50 products (lặp 10 sản phẩm × 5 category)
-DECLARE @i INT = 1;
-WHILE @i <= 50
-BEGIN
-    INSERT INTO Products (CategoryId, Name, Description, Price, Stock, IsActive, CreatedAt)
-    VALUES (
-        (@i % 5) + 1,
-        N'Sản phẩm ' + CAST(@i AS NVARCHAR),
-        N'Mô tả sản phẩm số ' + CAST(@i AS NVARCHAR),
-        CAST(100000 + (@i * 50000) AS DECIMAL(18,2)),
-        1000,
-        1,
-        GETUTCDATE()
-    );
-    SET @i = @i + 1;
-END;
-```
-
-### 3.3 Verify bằng curl trước khi test
+### 2.2 Verify 3 endpoint cần thiết
 
 ```bash
-# Login thử với 1 test user
+# 1. Health check — k6 kiểm tra trước khi test
+curl http://localhost:5000/health
+# Kỳ vọng: {"status":"Healthy"}
+
+# 2. Metrics endpoint — Prometheus scrape endpoint này
+curl http://localhost:5000/metrics
+# Kỳ vọng: thấy hàng trăm dòng bắt đầu bằng "# HELP" và số liệu
+
+# 3. Thử login với 1 test user (xác nhận seed thành công)
 curl -X POST http://localhost:5000/connect/token \
   -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "grant_type=password&client_id=angular-spa&username=loadtest_001@test.com&password=TestPass@123&scope=openid profile"
-
-# Kết quả phải có access_token
-# {"access_token":"eyJ...","token_type":"Bearer","expires_in":3600}
-
-# Dùng token vừa lấy để xem sản phẩm
-TOKEN="eyJ..."
-curl -H "Authorization: Bearer $TOKEN" http://localhost:5000/api/products
+  -d "grant_type=password&client_id=angular-spa&username=loadtest_001@test.com&password=TestPass@123&scope=openid profile email roles"
+# Kỳ vọng: {"access_token":"eyJ...","token_type":"Bearer","expires_in":3600}
 ```
+
+### 2.3 Verify Prometheus đang scrape API
+
+1. Mở `http://localhost:9090`
+2. Vào **Status → Targets**
+3. Target `dotnet-api` phải có `State = UP` màu xanh
+
+> Nếu `DOWN`: API chưa chạy, hoặc port sai. Prometheus dùng `host.docker.internal:5000` để trỏ vào API trên host machine.
+
+---
+
+## Bước 3 — Cấu hình Grafana (làm 1 lần duy nhất)
+
+### 3.1 Thêm datasource InfluxDB (cho k6)
+
+> InfluxDB lưu kết quả k6 — cần add để Grafana đọc được.
+
+1. Mở `http://localhost:3000`, login `admin / admin123`
+2. Sidebar trái → **Connections → Data Sources → Add new data source**
+3. Chọn **InfluxDB**
+4. Điền:
+   ```
+   URL:      http://influxdb:8086    ← dùng tên service Docker, không dùng localhost
+   Database: k6
+   ```
+5. Bấm **Save & Test** → phải hiện "datasource is working"
+
+### 3.2 Thêm datasource Prometheus (cho .NET API metrics)
+
+1. **Add new data source → Prometheus**
+2. URL: `http://prometheus:9090`
+3. **Save & Test**
+
+### 3.3 Import 3 dashboard có sẵn
+
+Vào **Dashboards → Import** và import lần lượt:
+
+| Dashboard ID | Tên | Datasource | Dùng để xem |
+|---|---|---|---|
+| `2587` | k6 Load Testing Results | InfluxDB | Kết quả k6 real-time |
+| `10915` | ASP.NET Core & Controllers | Prometheus | .NET API metrics |
+| `893` | Docker and OS metrics | Prometheus | CPU/RAM container |
+
+> Cách import: nhập ID → **Load** → chọn datasource tương ứng → **Import**
 
 ---
 
 ## Bước 4 — Chạy k6 từng giai đoạn
 
-### 4.1 Smoke Test — Kiểm tra script trước (1–2 users, 1 phút)
+> Luôn chạy theo thứ tự: **Smoke → Load → Stress → Spike**. Không nhảy thẳng lên Stress.
 
-> Mục tiêu: Đảm bảo script không có lỗi, flow hoạt động đúng.
+### 4.1 Smoke Test — 2 phút, 2 VU (luôn chạy đầu tiên)
 
-Tạo file `k6/smoke-test.js`:
-```javascript
-import { options as mainOptions } from './load-test.js';
-export { default } from './load-test.js';
+**Mục đích:** Xác nhận script không lỗi, flow login → đọc sản phẩm → tạo đơn hàng hoạt động đúng. Không đánh giá performance.
 
-// Override: chỉ 2 VU trong 1 phút
-export const options = {
-  vus:      2,
-  duration: '1m',
-  thresholds: {
-    http_req_failed: ['rate<0.01'],
-  },
-};
+```bash
+# Từ thư mục gốc project
+k6 run k6/smoke-test.js
 ```
 
-Chạy:
+Nếu không cài k6 local, dùng Docker:
 ```bash
-# Cách 1: Override trực tiếp từ command line
-k6 run --vus 2 --duration 1m k6/load-test.js
-
-# Cách 2: Docker
 docker run --rm -i \
-  -v $(pwd)/k6:/scripts \
+  -v ${PWD}/k6:/scripts \
   --add-host=host.docker.internal:host-gateway \
-  grafana/k6 run --vus 2 --duration 1m /scripts/load-test.js
+  grafana/k6 run \
+    --env BASE_URL=http://host.docker.internal:5000 \
+    /scripts/smoke-test.js
 ```
 
-Kết quả mong đợi (smoke test PASS):
-```
-✓ login 200.............: 100%
-✓ products 200..........: 100%
-✓ create order 201......: 98%   ← 2% fail là bình thường (stock 0, sản phẩm không tồn tại)
+> `--add-host=host.docker.internal:host-gateway` = cho phép container k6 trỏ vào API trên host machine (Windows/Linux). Trên Mac thì `host.docker.internal` tự động có sẵn.
 
-http_req_duration: avg=180ms  p(95)=420ms
+**Smoke test PASS khi:**
+```
+✓ [smoke] login 200        : 100%
+✓ [smoke] has access_token : 100%
+✓ [smoke] products 200     : 100%
+✓ [smoke] order not 500    : 100%
+
+http_req_failed: 0.00%   ← Phải là 0
 ```
 
-### 4.2 Load Test — Tải bình thường (k6/load-test.js gốc)
+Nếu có lỗi ở smoke test → **dừng lại, sửa trước** — đừng chạy load test.
+
+---
+
+### 4.2 Load Test — Tải bình thường (~13 phút)
+
+**Mục đích:** Đo performance ở tải bình thường (lên tới 1000 VU). Xem hệ thống chịu được không.
 
 ```bash
-# Chạy với output vào InfluxDB để xem real-time trên Grafana
+# Gửi kết quả vào InfluxDB để xem real-time trên Grafana
 k6 run \
   --out influxdb=http://localhost:8086/k6 \
-  -e BASE_URL=http://localhost:5000 \
+  --env BASE_URL=http://localhost:5000 \
   k6/load-test.js
+```
 
-# Docker version:
+Docker:
+```bash
 docker run --rm -i \
-  -v $(pwd)/k6:/scripts \
+  -v ${PWD}/k6:/scripts \
   --network host \
   grafana/k6 run \
     --out influxdb=http://localhost:8086/k6 \
-    -e BASE_URL=http://localhost:5000 \
+    --env BASE_URL=http://localhost:5000 \
     /scripts/load-test.js
 ```
 
-### 4.3 Stress Test — Tìm giới hạn hệ thống
+> `--network host` = container dùng thẳng network của host → có thể kết nối tới InfluxDB và API qua localhost. Chỉ dùng được trên Linux; trên Windows/Mac dùng `host.docker.internal`.
 
-Chỉnh sửa stages trong `load-test.js` để test tới 2000 VU:
+Trong lúc k6 chạy, **mở Grafana dashboard ID 2587** để xem real-time.
+
+---
+
+### 4.3 Stress Test — Tìm giới hạn (manual)
+
+**Mục đích:** Tăng VU vượt ngưỡng bình thường để tìm điểm hệ thống bắt đầu fail.
+
+Mở [k6/load-test.js](k6/load-test.js) và tạm thời đổi `stages` thành:
 
 ```javascript
+// Stress test — thêm giai đoạn 2000 VU
 export const options = {
   stages: [
     { duration: '2m', target: 200  },
     { duration: '5m', target: 500  },
     { duration: '5m', target: 1000 },
-    { duration: '5m', target: 2000 },  // ← Hệ thống bắt đầu fail ở đây
+    { duration: '5m', target: 2000 },  // ← Mức này sẽ thấy hệ thống bắt đầu fail
     { duration: '3m', target: 0    },
   ],
 };
 ```
 
-### 4.4 Spike Test — Đột ngột tăng tải (giả lập flash sale)
+> Với 2 core + SQL Server chung máy, hệ thống thường fail ở khoảng 500–1000 VU. Đây là kiến thức thực tế quan trọng.
+
+---
+
+### 4.4 Spike Test — Flash sale simulation (manual)
+
+**Mục đích:** Giả lập đột ngột tăng tải (Flash sale, event) — xem hệ thống có recover được không sau khi tải drop xuống.
 
 ```javascript
 export const options = {
   stages: [
     { duration: '30s', target: 10   },  // Tải thấp bình thường
-    { duration: '10s', target: 1000 },  // ← Đột ngột tăng (spike)
+    { duration: '10s', target: 1000 },  // ← Spike: 10 giây từ 10 → 1000 VU
     { duration: '3m',  target: 1000 },  // Giữ tải cao
     { duration: '10s', target: 10   },  // Drop về bình thường
     { duration: '30s', target: 0    },
@@ -674,343 +595,281 @@ export const options = {
 };
 ```
 
+Sau khi tải drop về 10 VU, nếu latency về mức bình thường → hệ thống **self-recover được**.
+Nếu latency vẫn cao → hệ thống đang bị treo (connection pool bị cạn, GC đang chạy, v.v.).
+
 ---
 
-## Bước 5 — Đọc Output k6 Terminal (Real-time)
+## Bước 5 — Đọc Output k6 Terminal
 
-Trong khi k6 chạy, terminal sẽ hiển thị:
+Trong lúc k6 chạy, terminal hiển thị progress:
 
 ```
-          /\      |‾‾| /‾‾/   /‾‾/
-     /\  /  \     |  |/  /   /  /
-    /  \/    \    |     (   /   ‾‾\
-   /          \   |  |\  \ |  (‾)  |
-  / __________ \  |__| \__\ \_____/ .io
-
-  execution: local
-     script: k6/load-test.js
-     output: influxdb (http://localhost:8086/k6)
-
-  scenarios: (100.00%) 1 scenario, 1000 max VUs, 14m30s max duration
-           * default: Up to 1000 looping VUs for 13m0s over 5 stages
-
-running (05m30.0s), 500/1000 VUs, 12450 complete and 0 interrupted iterations
+running (05m30.0s), 500/1000 VUs, 12450 complete iterations
 default ↓ [===============>------] 500/1000 VUs  05m30.0s/13m00.0s
+          ↑ số VU hiện tại         ↑ tiến trình
 ```
 
-### Giải thích các dòng cuối sau khi test kết thúc
+Sau khi xong, k6 in summary:
 
 ```
-     ✓ login 200.............: 99.82% ✓ 24560 ✗ 44
-     ✓ products 200..........: 98.41% ✓ 24173 ✗ 387
-     ✓ create order 201......: 94.20% ✓ 11610 ✗ 714  ← Nhiều fail → vấn đề!
-     ✓ create order not 500..: 97.30% ✓ 11980 ✗ 324
+     ✓ login 200.............: 99.82% ✓ 24560  ✗ 44
+     ✓ products 200..........: 98.41% ✓ 24173  ✗ 387
+     ✓ create order 201......: 94.20% ✓ 11610  ✗ 714   ← Nhiều fail → đây là bottleneck
+     ✓ create order not 500..: 97.30% ✓ 11980  ✗ 324
 
-     checks.........................: 97.35% ✓ 72343 ✗ 1969
-     data_received..................: 1.2 GB 1.5 MB/s
-     data_sent......................: 45 MB  57 kB/s
-     http_req_blocked...............: avg=1.2ms    min=1µs    med=3µs    max=2.89s   p(90)=5µs    p(95)=7µs
-     http_req_connecting............: avg=800µs    min=0s     med=0s     max=1.84s   p(90)=0s     p(95)=0s
-   ✗ http_req_duration..............: avg=1.23s    min=12ms   med=890ms  max=28.3s   p(90)=2.8s   p(95)=4.1s
-       { expected_response:true }...: avg=1.10s    min=12ms   med=780ms  max=25s     p(90)=2.5s   p(95)=3.6s
-     http_req_failed................: 3.20%  ✗ 1969  ✓ 59634
-     http_req_receiving.............: avg=145µs    min=9µs    med=68µs   max=890ms
-     http_req_sending...............: avg=89µs     min=5µs    med=32µs   max=450ms
-     http_req_tls_handshaking.......: avg=0s       min=0s     med=0s     max=0s
-     http_req_waiting...............: avg=1.08s    min=8ms    med=730ms  max=27.8s   p(90)=2.6s   p(95)=3.9s
-     http_reqs......................: 61603  78.98/s
-     iteration_duration.............: avg=8.45s    min=2.1s   med=7.2s   max=45s     p(90)=15s    p(95)=22s
-     iterations.....................: 12320  15.80/s
-     login_duration.................: avg=420ms    p(95)=1.2s
-     product_list_duration..........: avg=180ms    p(95)=450ms
-     create_order_duration..........: avg=2.1s     p(95)=5.8s  ← Bottleneck rõ ràng
-     vus............................: 1000   min=2     max=1000
-     vus_max........................: 1000   min=1000  max=1000
+     http_req_duration..........: avg=1.23s  p(95)=4.1s
+     http_req_failed............: 3.20%
+     http_req_waiting...........: avg=1.08s  p(95)=3.9s  ← Thời gian server xử lý
+     http_req_blocked...........: avg=1.2ms  p(95)=7µs   ← Thời gian chờ TCP connect
+     http_reqs..................: 61603  78.98/s          ← Throughput
+     vus........................: 1000   max=1000
+     
+     login_duration.............: avg=420ms   p(95)=1.2s
+     product_list_duration......: avg=180ms   p(95)=450ms
+     create_order_duration......: avg=2.1s    p(95)=5.8s  ← Bottleneck rõ ràng
 ```
 
-### Bảng giải thích từng metric
+### Đọc từng metric
 
-| Metric | Ý nghĩa | Giá trị tốt | Giá trị xấu |
-|---|---|---|---|
-| `http_req_duration` | Tổng thời gian 1 request (từ gửi đến nhận xong) | p95 < 2s | p95 > 5s |
-| `http_req_waiting` | Thời gian server xử lý (TTFB) | < 1s | > 3s |
-| `http_req_blocked` | Chờ kết nối TCP (connection pool full?) | < 5ms | > 100ms |
-| `http_req_failed` | Tỷ lệ lỗi (4xx, 5xx, timeout) | < 1% | > 5% |
-| `http_reqs` | Tổng requests và throughput (req/s) | Tùy mục tiêu | Drop đột ngột |
-| `iteration_duration` | Thời gian 1 vòng lặp của VU (bao gồm sleep) | < 10s | > 30s |
-| `vus` | Số VU đang chạy thực tế | = target | < target = VU bị treo |
+| Metric | Đọc thế nào | Ngưỡng quan tâm |
+|---|---|---|
+| `http_req_duration` p95 | 95% request hoàn thành trong bao lâu — **dùng cái này để đánh giá** | < 2s tốt, > 5s xấu |
+| `http_req_waiting` | Thời gian server xử lý (bỏ qua network) — tìm bottleneck server | Nếu cao → server chậm |
+| `http_req_blocked` | Chờ TCP connection — nếu cao là connection pool bị cạn | > 100ms → vấn đề |
+| `http_req_failed` | Tỷ lệ lỗi 4xx/5xx/timeout | < 1% tốt, > 5% xấu |
+| `create_order_duration` | Custom metric — riêng cho endpoint tạo đơn hàng | Thường cao nhất vì có DB write |
+| `vus` | Số VU thực tế đang chạy | Nếu < target → VU bị timeout/treo |
 
-### Hiểu Percentiles (p50, p90, p95, p99)
-
-```
-avg=1.23s   ← Trung bình (bị ảnh hưởng bởi outlier)
-p(50)=890ms ← 50% request hoàn thành dưới 890ms (median — đáng tin hơn avg)
-p(90)=2.8s  ← 90% request hoàn thành dưới 2.8s
-p(95)=4.1s  ← 95% request hoàn thành dưới 4.1s  ← DÙNG METRIC NÀY để đánh giá SLA
-p(99)=12s   ← 1% request chậm nhất (outlier, thường là request đầu tiên hoặc GC pause)
-max=28.3s   ← Request chậm nhất (đừng quá lo nếu chỉ 1–2 lần)
-```
-
-> **Quy tắc thực tế:** Dùng **p95** để đánh giá hệ thống. Nếu p95 < 2s, 95% người dùng trải nghiệm tốt.
-
-### Đọc Thresholds (PASS/FAIL)
+### Hiểu Percentile (tại sao không dùng avg)
 
 ```
-✓ http_req_duration............: avg=1.23s  p(95)=4.1s    ← ✗ FAIL (threshold p95<3000ms)
-✗ http_req_failed..............: 3.20%                    ← ✗ FAIL (threshold rate<0.01)
+avg=1.23s   ← Bị kéo lên bởi vài request rất chậm (outlier) — không đại diện
+p(50)=890ms ← Một nửa user thấy tốc độ này — median, đáng tin hơn avg
+p(95)=4.1s  ← 95% user thấy dưới 4.1s, 5% thấy chậm hơn — DÙNG CÁI NÀY
+p(99)=12s   ← 1% user chậm nhất (thường do GC pause hoặc cold start)
+max=28.3s   ← 1 request chậm nhất — đừng lo nếu chỉ xuất hiện 1–2 lần
 ```
 
-- `✓` = threshold đạt
-- `✗` = threshold không đạt → k6 exit với error code 99 → CI pipeline fail
+### Đọc PASS/FAIL của threshold
+
+```
+✓ http_req_duration: p(95)=1.8s    → PASS (threshold p95<3000ms)
+✗ http_req_failed:   3.20%         → FAIL (threshold rate<0.05)
+```
+
+k6 trả về **exit code 99** nếu có threshold FAIL → CI pipeline sẽ fail theo.
 
 ---
 
-## Bước 6 — Setup Grafana Dashboard (Visual Monitoring)
+## Bước 6 — Đọc Grafana Dashboard
 
-### 6.1 Mở Grafana và cấu hình InfluxDB datasource
+### Dashboard k6 (ID 2587) — Xem trong lúc test chạy
 
-1. Mở trình duyệt: `http://localhost:3000`
-2. Login: `admin` / `admin123`
-3. Vào **Connections → Data Sources → Add data source**
-4. Chọn **InfluxDB**
-5. Điền:
-   ```
-   URL:      http://influxdb:8086
-   Database: k6
-   ```
-6. Click **Save & Test** → phải hiện "Data source connected"
-
-### 6.2 Cấu hình Prometheus datasource
-
-1. **Connections → Data Sources → Add data source**
-2. Chọn **Prometheus**
-3. URL: `http://prometheus:9090`
-4. **Save & Test**
-
-### 6.3 Import Dashboard k6 (có sẵn trên Grafana.com)
-
-1. Vào **Dashboards → Import**
-2. Nhập ID: **`2587`** → Click **Load**
-3. Chọn datasource **InfluxDB** → **Import**
-
-Hoặc import dashboard .NET:
-- ID **`10915`** — ASP.NET Core metrics (prometheus-net)
-- ID **`893`** — Docker container metrics (cAdvisor)
-
-### 6.4 Đọc Dashboard k6 (ID 2587)
-
-Dashboard có các panels:
+Mở `http://localhost:3000`, vào dashboard **k6 Load Testing Results**.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  Virtual Users (VUs)        │  Request Rate (req/s)     │
-│  [graph tăng theo stages]   │  [số request/giây]        │
+│  Virtual Users          │  Request Rate (req/s)          │
+│  [tăng theo stages]     │  [số request API nhận/giây]    │
 ├─────────────────────────────────────────────────────────┤
 │  Response Time (ms)                                     │
-│  ── p50 (xanh)  ── p90 (vàng)  ── p95 (cam)  ── p99    │
+│  ── p50 (xanh) ── p90 (vàng) ── p95 (cam) ── p99 (đỏ) │
 │                                                         │
-│  Hình dạng lý tưởng: đường thẳng ngang                 │
-│  Nguy hiểm: đường đi lên theo số VU → không scale được │
+│  Lý tưởng: đường thẳng ngang khi VU tăng               │
+│  Nguy hiểm: đường đi lên tỷ lệ thuận với VU            │
 ├─────────────────────────────────────────────────────────┤
-│  Error Rate (%)             │  Check Pass Rate (%)      │
-│  [< 1% = tốt]              │  [> 99% = tốt]            │
+│  Error Rate (%)         │  Check Pass Rate (%)           │
+│  < 1% = bình thường     │  > 99% = tốt                  │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Cách đọc Response Time graph:**
+**Cách đọc Response Time graph — tìm điểm bão hòa:**
 
 ```
 ms
-4000 |                                      ╭────╮
-3000 |                              ╭───────╯    │  ← p95 vượt ngưỡng ở 800 VUs
-2000 |                     ╭────────╯            │    → đây là điểm bão hòa
-1000 |──────────────────────╯
-   0 └────────────────────────────────────────────→ thời gian / VUs
-       50  100  200  300  500  800  1000
+4000 |                                   ╭─────
+3000 |                          ╭────────╯       ← p95 vượt 3s ở ~800 VU
+2000 |               ╭──────────╯                  → đây là điểm hệ thống bão hòa
+1000 |───────────────╯
+   0 └───────────────────────────────────────────→ số VU
+      50  100  200  300  500  800  1000
 ```
 
-→ Hệ thống này bắt đầu degraded ở 800 VUs.
+Điểm mà p95 bắt đầu tăng mạnh = ngưỡng hệ thống chịu được. Với 2 core thường ở khoảng 300–800 VU tùy workload.
 
 ---
 
-## Bước 7 — Đọc Dashboard .NET API (ID 10915)
+### Dashboard .NET API (ID 10915) — Xem sức khoẻ API
 
-### Panels quan trọng
-
-| Panel | Ý nghĩa | Hành động khi xấu |
+| Panel | Đọc thế nào | Dấu hiệu xấu |
 |---|---|---|
-| **HTTP Request Rate** | Request/s đang xử lý | Nếu thấp hơn k6 gửi → API bị queue |
-| **HTTP Request Duration** | Latency theo route | Tìm route nào chậm nhất |
-| **Active Requests** | Số request đang chờ | > 50 → connection pool có vấn đề |
-| **GC Collections (Gen0/1/2)** | Garbage Collection | Gen2 tăng liên tục → memory leak |
-| **Heap Size** | RAM .NET đang dùng | Tăng không ngừng → memory leak |
-| **Thread Pool Queue** | Tasks chờ trong queue | > 0 → CPU là bottleneck |
-| **Exception Rate** | Unhandled exceptions/s | > 0 → bug hoặc quá tải |
+| **HTTP Request Rate** | Request/giây API đang xử lý | Thấp hơn k6 gửi → API đang queue |
+| **HTTP Request Duration** | Latency phân theo từng route | Route nào bar cao nhất → đó là bottleneck |
+| **Active Requests** | Số request đang chờ xử lý | > 50 → Kestrel thread pool đang đầy |
+| **GC Collections Gen0/1/2** | Tần suất Garbage Collection | Gen2 tăng liên tục → có memory leak |
+| **Heap Size** | RAM .NET process đang dùng | Tăng không ngừng → memory leak |
+| **Thread Pool Queue** | Task đang chờ thread | > 0 → CPU là bottleneck |
+| **Exception Rate** | Lỗi unhandled/giây | > 0 → bug hoặc hệ thống quá tải |
 
-### Dấu hiệu bottleneck theo panel
+**Diễn giải bottleneck:**
 
-**CPU bottleneck (2 core bị saturate):**
 ```
-Thread Pool Queue > 0          → Có task đang chờ CPU
-process_cpu_seconds tăng ~2/s  → 100% CPU utilization
-HTTP Duration tăng đều theo VU → Không scale được thêm
-```
+Thread Pool Queue > 0  +  CPU ~100%
+→ CPU là cổ chai — cần scale out hoặc tối ưu code
 
-**SQL Server bottleneck:**
-```
-HTTP Request Duration cao (>2s) nhưng CPU .NET thấp
-→ App đang chờ DB trả lời → Cần xem SQL Server metrics
-```
+HTTP Duration cao (>2s)  +  CPU .NET thấp (<30%)
+→ App đang ngồi chờ SQL Server — cần tối ưu query hoặc thêm index
 
-**Memory pressure:**
-```
-GC Gen2 collections tăng → Major GC đang chạy → Pause mọi thread
-Heap size tăng liên tục → Memory leak
+GC Gen2 tăng liên tục  +  Heap Size không giảm
+→ Memory leak — cần dùng dotnet-dump hoặc dotMemory để điều tra
 ```
 
 ---
 
-## Bước 8 — Monitoring SQL Server trong khi test
+### Dashboard cAdvisor (ID 893) — CPU/RAM của Docker containers
 
-### 8.1 Xem slow queries real-time (SSMS)
+Xem panel **CPU Usage** và **Memory Usage** của các container:
 
-Chạy query sau trên SQL Server trong lúc k6 đang test:
+```bash
+# Xem nhanh không cần Grafana
+docker stats --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+
+# Output mẫu khi đang load test:
+# NAME         CPU %     MEM USAGE / LIMIT
+# prometheus   2.1%      512MiB / 16GiB
+# grafana      1.3%      256MiB / 16GiB
+# influxdb     8.4%      1.2GiB / 16GiB
+# cadvisor     3.2%      128MiB / 16GiB
+```
+
+> cAdvisor chỉ theo dõi các container trong Docker. API đang chạy trên host (`dotnet run`) nên không thấy ở đây — xem qua Grafana dashboard .NET (ID 10915) hoặc `process_cpu_seconds_total` trong Prometheus.
+
+---
+
+## Bước 7 — Theo dõi SQL Server trong lúc test
+
+Mở **SSMS** hoặc **Azure Data Studio**, kết nối vào SQL Server, chạy các query sau **trong lúc k6 đang test** để xem SQL đang "chịu đựng" như thế nào.
+
+### Query 1: Top query chậm đang chạy
 
 ```sql
--- Top 10 query chậm nhất đang chạy
+-- Chạy lại nhiều lần để xem query nào liên tục xuất hiện
 SELECT TOP 10
     r.session_id,
     r.status,
-    r.wait_type,
-    r.wait_time / 1000.0       AS wait_sec,
-    r.cpu_time / 1000.0        AS cpu_sec,
-    r.total_elapsed_time / 1000.0 AS elapsed_sec,
-    r.logical_reads,
+    r.wait_type,                                  -- Đang chờ gì?
+    r.wait_time / 1000.0       AS wait_sec,       -- Chờ bao lâu rồi
+    r.total_elapsed_time / 1000.0 AS elapsed_sec, -- Tổng thời gian từ khi bắt đầu
+    r.logical_reads,                               -- Số page đọc từ buffer — cao = thiếu index
     SUBSTRING(t.text, (r.statement_start_offset/2)+1,
         ((CASE r.statement_end_offset WHEN -1 THEN DATALENGTH(t.text)
           ELSE r.statement_end_offset END - r.statement_start_offset)/2)+1) AS query_text
 FROM sys.dm_exec_requests r
 CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
-WHERE r.session_id > 50        -- Bỏ qua system sessions
+WHERE r.session_id > 50         -- Bỏ qua system sessions
 ORDER BY r.total_elapsed_time DESC;
 ```
 
-### 8.2 Xem số connections đang mở
+### Query 2: Số connection đang mở
 
 ```sql
--- Connections theo database
-SELECT DB_NAME(dbid) AS database_name, COUNT(*) AS connections
+-- Bình thường: 10–30 | Nguy hiểm: > 100
+SELECT DB_NAME(dbid) AS db, COUNT(*) AS connections
 FROM sys.sysprocesses
 WHERE dbid > 0
 GROUP BY dbid
 ORDER BY connections DESC;
 ```
 
-**Bình thường:** 10–30 connections
-**Nguy hiểm:** > 100 connections → connection pool leak hoặc không đủ pool size
+> Nếu connection > 100 → connection pool của .NET đang bị rò rỉ hoặc `Max Pool Size` quá nhỏ.
 
-### 8.3 Xem wait statistics (tìm bottleneck SQL)
+### Query 3: Wait statistics — SQL đang chờ gì nhiều nhất
 
 ```sql
--- Xem SQL Server đang chờ gì nhiều nhất
+-- Chạy khi thấy latency cao nhưng không biết tại sao
 SELECT TOP 10
     wait_type,
-    wait_time_ms / 1000.0       AS wait_sec,
-    signal_wait_time_ms / 1000.0 AS signal_sec,
+    wait_time_ms / 1000.0 AS wait_sec,
     waiting_tasks_count
 FROM sys.dm_os_wait_stats
 WHERE wait_type NOT IN (
-    'SLEEP_TASK','BROKER_TO_FLUSH','BROKER_TASK_STOP','CLR_AUTO_EVENT',
-    'DISPATCHER_QUEUE_SEMAPHORE','FT_IFTS_SCHEDULER_IDLE_WAIT',
-    'HADR_FILESTREAM_IOMGR_IOCOMPLETION','HADR_WORK_QUEUE',
-    'LAZYWRITER_SLEEP','LOGMGR_QUEUE','ONDEMAND_TASK_QUEUE',
-    'REQUEST_FOR_DEADLOCK_SEARCH','RESOURCE_QUEUE','SERVER_IDLE_CHECK',
-    'SLEEP_DBSTARTUP','SLEEP_DBRECOVER','SLEEP_MASTERDBREADY',
-    'SLEEP_MASTERMDREADY','SLEEP_MASTERUPGRADED','SLEEP_MSDBSTARTUP',
-    'SLEEP_SYSTEMTASK','SLEEP_TEMPDBSTARTUP','SNI_HTTP_ACCEPT',
-    'SP_SERVER_DIAGNOSTICS_SLEEP','SQLTRACE_BUFFER_FLUSH',
-    'SQLTRACE_INCREMENTAL_FLUSH_SLEEP','WAIT_XTP_OFFLINE_CKPT_NEW_LOG',
-    'WAITFOR','XE_DISPATCHER_WAIT','XE_TIMER_EVENT'
+    'SLEEP_TASK','LAZYWRITER_SLEEP','SQLTRACE_BUFFER_FLUSH',
+    'WAITFOR','XE_DISPATCHER_WAIT','XE_TIMER_EVENT',
+    'REQUEST_FOR_DEADLOCK_SEARCH','RESOURCE_QUEUE'
 )
 ORDER BY wait_time_ms DESC;
 ```
 
-| Wait Type | Ý nghĩa |
-|---|---|
-| `PAGEIOLATCH_SH` | Đọc dữ liệu từ disk → cần SSD hoặc thêm RAM |
-| `LCK_M_X` | Lock tranh chấp → deadlock, cần tối ưu transaction |
-| `CXPACKET` | Parallel query → CPU bị chia nhỏ |
-| `ASYNC_NETWORK_IO` | App đọc data chậm hơn SQL ghi → N+1 query |
-| `RESOURCE_SEMAPHORE` | Quá nhiều query cần RAM cùng lúc |
+**Đọc kết quả:**
+
+| Wait Type | Nghĩa là | Giải pháp |
+|---|---|---|
+| `LCK_M_X` | Row/table lock — nhiều transaction tranh nhau ghi cùng 1 row | Tối ưu transaction, dùng optimistic lock |
+| `PAGEIOLATCH_SH` | Đọc từ disk (buffer cache miss) — thiếu RAM hoặc thiếu index | Thêm index, tăng RAM |
+| `ASYNC_NETWORK_IO` | SQL ghi nhanh hơn app đọc — thường do N+1 query | Dùng `.Include()`, batch query |
+| `CXPACKET` | Parallel query chiếm nhiều CPU | Giới hạn `MAXDOP` hoặc tối ưu query |
 
 ---
 
-## Bước 9 — Phân tích kết quả và hành động
-
-### 9.1 Quy trình phân tích 5 bước
+## Bước 8 — Quy trình phân tích khi thấy vấn đề
 
 ```
-1. Xem Error Rate trong k6 output
-       ↓
-   Nếu > 5% → Hệ thống đang fail → Tìm nguyên nhân ngay
-
-2. Xem p95 của http_req_duration
-       ↓
-   < 1s  → Tốt
-   1–3s  → Chấp nhận được (warning)
-   > 3s  → Xấu, cần tối ưu
-
-3. Xem tại route nào chậm nhất (Grafana: HTTP Duration by route)
-       ↓
-   Thường là: POST /api/orders (write + deduct stock + transaction)
-
-4. Xem CPU và RAM (cAdvisor dashboard)
-       ↓
-   CPU 100% → Scale CPU hoặc tối ưu code
-   RAM đầy → Tăng RAM hoặc fix memory leak
-
-5. Xem SQL Server wait stats
-       ↓
-   LCK_M_X cao → Transaction quá dài, cần tối ưu
-   PAGEIOLATCH cao → Thêm index
+k6 báo lỗi hoặc latency cao
+         │
+         ▼
+┌────────────────────────────┐
+│ Error rate > 5%?           │──Có──► Xem log API: dotnet run terminal
+│                            │         Tìm exception, 500 error
+└────────────────────────────┘
+         │ Không
+         ▼
+┌────────────────────────────┐
+│ p95 > 3s?                  │──Có──► Xem Grafana ID 10915:
+│                            │         Route nào chậm nhất?
+└────────────────────────────┘
+         │ Không
+         ▼
+┌────────────────────────────┐
+│ CPU .NET > 90%?            │──Có──► CPU bottleneck
+│ (Thread Pool Queue > 0)    │         → Scale out hoặc tối ưu code
+└────────────────────────────┘
+         │ Không
+         ▼
+┌────────────────────────────┐
+│ CPU thấp mà latency cao?   │──Có──► SQL bottleneck
+│                            │         → Chạy Query 1 & 3 trong SSMS
+└────────────────────────────┘
+         │ Không
+         ▼
+┌────────────────────────────┐
+│ GC Gen2 tăng liên tục?     │──Có──► Memory leak
+│ Heap không giảm?           │         → Cần profiler (dotnet-dump)
+└────────────────────────────┘
 ```
 
-### 9.2 Các tối ưu theo thứ tự ưu tiên
+### Các tối ưu theo thứ tự ưu tiên (từ dễ đến khó)
 
 | Vấn đề | Phát hiện qua | Giải pháp | Effort |
 |---|---|---|---|
-| Thiếu DB index | SQL slow query, high wait | Thêm index (CreatedAt, UserId, CategoryId) | Thấp |
-| N+1 query | CPU thấp nhưng latency cao | Dùng `.Include()` hoặc batch query | Thấp |
-| Connection pool nhỏ | `http_req_blocked` cao | Tăng `Max Pool Size` trong connection string | Thấp |
-| Response không cache | Sản phẩm query nhiều lần | Thêm Redis cache cho GET /api/products | Trung bình |
-| Transaction quá dài | `LCK_M_X` wait cao | Tách nhỏ transaction, dùng optimistic lock | Trung bình |
-| CPU bão hòa | Thread pool queue > 0 | Scale out (thêm instance API) | Cao |
-| DB là single point | Mọi thứ chậm cùng lúc | Read replica hoặc sharding | Cao |
-
-### 9.3 Lệnh một dòng để xem container resource
-
-```bash
-# Xem CPU/RAM của từng container real-time (cập nhật 2 giây)
-docker stats --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"
-
-# Output:
-# NAME          CPU %     MEM USAGE / LIMIT     MEM %
-# api           185.2%    1.2GiB / 16GiB        7.5%    ← Đang dùng 185% CPU (2 cores = 200% max)
-# sqlserver     45.3%     4.8GiB / 16GiB        30%
-# prometheus    2.1%      512MiB / 16GiB         3.2%
-```
+| Thiếu DB index | `logical_reads` cao, `PAGEIOLATCH` | Thêm index trên `UserId`, `CategoryId`, `CreatedAt` | Thấp |
+| N+1 query | CPU thấp nhưng latency cao, `ASYNC_NETWORK_IO` | Dùng `.Include()` trong EF Core | Thấp |
+| Connection pool nhỏ | `http_req_blocked` cao, connections > 100 | Thêm `Max Pool Size=200` vào connection string | Thấp |
+| Không cache response | GET /api/products bị query DB mỗi lần | Thêm Redis cache với expiry 30s | Trung bình |
+| Transaction quá dài | `LCK_M_X` wait cao | Tách transaction, dùng optimistic concurrency | Trung bình |
+| CPU bão hòa | Thread Pool Queue > 0 liên tục | Scale out (thêm instance), load balancer | Cao |
 
 ---
 
 ## Checklist trước mỗi lần chạy test
 
 ```
-[ ] Monitoring stack đang chạy (docker stats)
-[ ] API trả về /health = 200
-[ ] 100 test users đã có trong DB
-[ ] Categories và Products đã được seed
-[ ] Grafana đang load dashboard
-[ ] Smoke test (2 VU) chạy thành công
-[ ] Mở tab SQL Server để theo dõi wait stats
-[ ] Sẵn sàng ghi nhận thời điểm hệ thống bắt đầu fail
+[ ] docker compose ps  → 4 container đang running
+[ ] curl localhost:5000/health  → {"status":"Healthy"}
+[ ] curl localhost:5000/metrics  → thấy số liệu (không phải 404)
+[ ] localhost:9090 → Status → Targets → dotnet-api = UP
+[ ] localhost:3000  → Grafana login được, datasource hoạt động
+[ ] Smoke test PASS (2 VU, 0% error)
+[ ] Mở SSMS sẵn với 3 query monitor ở trên
+[ ] Ghi lại thời điểm bắt đầu test để correlate với Grafana timeline
 ```
