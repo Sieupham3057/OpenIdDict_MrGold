@@ -33,6 +33,15 @@
 - [5. cAdvisor — Giám sát container](#5-cadvisor--giám-sát-docker-container)
 - [6. Tổng hợp — Khi nào dùng cái nào](#6-tổng-hợp--khi-nào-dùng-cái-nào)
 
+**[Phần 4 — Bảng lệnh Docker Compose thường dùng](#phần-4--bảng-lệnh-docker-compose-thường-dùng)**
+- [Khởi động / Dừng stack](#khởi-động--dừng-stack)
+- [Build image](#build-image)
+- [Xem log](#xem-log)
+- [Kiểm tra trạng thái](#kiểm-tra-trạng-thái)
+- [Vào trong container](#vào-trong-container)
+- [Dọn dẹp](#dọn-dẹp)
+- [Workflow thực tế](#workflow-thực-tế)
+
 ---
 
 ## 1. Server specs này phục vụ được bao nhiêu concurrent user?
@@ -1201,3 +1210,139 @@ Câu hỏi                                      │ Tool
 | Bỏ cAdvisor | Không xem metrics Docker container. Vẫn xem được API qua Prometheus. |
 | Bỏ Grafana | Phải đọc terminal k6 + Prometheus UI riêng lẻ, không có dashboard tổng hợp. |
 | **Tối thiểu để học** | k6 + terminal là đủ để thấy system fail. Các tool còn lại giúp hiểu *tại sao* fail. |
+
+---
+
+---
+
+# PHẦN 4 — Bảng lệnh Docker Compose thường dùng
+
+> Tất cả lệnh chạy từ thư mục chứa file `docker-compose.monitoring.yml`.
+
+---
+
+## Khởi động / Dừng stack
+
+```bash
+# Khởi động toàn bộ stack (lần đầu — build image + start)
+docker compose -f docker-compose.monitoring.yml up -d --build
+
+# Khởi động lại (không build lại — image đã cache)
+docker compose -f docker-compose.monitoring.yml up -d
+
+# Dừng tất cả container (giữ nguyên volume/data)
+docker compose -f docker-compose.monitoring.yml down
+
+# Dừng và XÓA volume (reset sạch data Grafana, InfluxDB, Prometheus)
+docker compose -f docker-compose.monitoring.yml down -v
+
+# Restart 1 service cụ thể (ví dụ: api)
+docker compose -f docker-compose.monitoring.yml restart api
+```
+
+---
+
+## Build image
+
+```bash
+# Build lại toàn bộ image (dùng khi đổi code hoặc Dockerfile)
+docker compose -f docker-compose.monitoring.yml build
+
+# Build lại KHÔNG dùng cache (khi thay đổi base image, cài package mới)
+docker compose -f docker-compose.monitoring.yml build --no-cache
+
+# Build 1 service cụ thể không cache
+docker compose -f docker-compose.monitoring.yml build --no-cache api
+
+# Build xong rồi start luôn (kết hợp)
+docker compose -f docker-compose.monitoring.yml up -d --build --force-recreate
+```
+
+---
+
+## Xem log
+
+```bash
+# Xem log realtime của API (Ctrl+C để thoát)
+docker logs api --follow
+
+# Xem 50 dòng cuối của API log
+docker logs api --tail 50
+
+# Xem log của tất cả service trong compose (realtime)
+docker compose -f docker-compose.monitoring.yml logs -f
+
+# Xem log 1 service cụ thể qua compose
+docker compose -f docker-compose.monitoring.yml logs -f api
+docker compose -f docker-compose.monitoring.yml logs -f prometheus
+```
+
+---
+
+## Kiểm tra trạng thái
+
+```bash
+# Xem tất cả container đang chạy + trạng thái health
+docker compose -f docker-compose.monitoring.yml ps
+
+# Xem CPU/RAM realtime của tất cả container
+docker stats
+
+# Xem CPU/RAM dạng bảng gọn (không refresh)
+docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"
+
+# Kiểm tra network nội bộ Docker (tên service → IP)
+docker network inspect docker_default
+```
+
+---
+
+## Vào trong container
+
+```bash
+# Mở shell bash vào container api
+docker exec -it api bash
+
+# Chạy lệnh 1 lần trong container (không mở shell)
+docker exec api dotnet --version
+docker exec api env | grep ConnectionStrings
+```
+
+---
+
+## Dọn dẹp
+
+```bash
+# Xóa tất cả image không dùng (giải phóng disk)
+docker image prune -a
+
+# Xóa tất cả container đã dừng + image + volume không dùng
+docker system prune -a --volumes
+
+# Xem disk Docker đang dùng bao nhiêu
+docker system df
+```
+
+---
+
+## Workflow thực tế
+
+```
+# Lần đầu chạy — hoặc sau khi sửa code/Dockerfile
+docker compose -f docker-compose.monitoring.yml up -d --build
+
+# Lần sau (không đổi code)
+docker compose -f docker-compose.monitoring.yml up -d
+
+# Sau khi đổi Dockerfile hoặc cài thêm package NuGet
+docker compose -f docker-compose.monitoring.yml build --no-cache api
+docker compose -f docker-compose.monitoring.yml up -d
+
+# Reset hoàn toàn (xóa data cũ, build từ đầu)
+docker compose -f docker-compose.monitoring.yml down -v
+docker compose -f docker-compose.monitoring.yml up -d --build --no-cache
+
+# Kiểm tra sau khi start
+docker compose -f docker-compose.monitoring.yml ps
+docker logs api --tail 30
+```
