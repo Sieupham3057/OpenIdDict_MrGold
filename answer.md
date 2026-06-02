@@ -43,14 +43,16 @@
 - [Workflow thực tế](#workflow-thực-tế)
 
 **[Phần 5 — OpenIddict Certificate trong Docker: Nguyên nhân lỗi & Fix chuẩn](#phần-5--openiddict-certificate-trong-docker-nguyên-nhân-lỗi--fix-chuẩn)**
-- [Chuỗi nguyên nhân — Tại sao lỗi xảy ra](#chuỗi-nguyên-nhân--tại-sao-lỗi-xảy-ra)
-- [Tại sao AddDevelopmentEncryptionCertificate lại cố ghi file?](#tại-sao-adddevelopmentencryptioncertificate-lại-cố-ghi-file)
-- [Fix cấp độ 1 — Docker lab / staging](#fix-cấp-độ-1--docker-lab--staging-nhanh-nhất)
+- [Chuỗi nguyên nhân từng bước](#chuỗi-nguyên-nhân-từng-bước)
+  - [Bước 1: ASPNETCORE_ENVIRONMENT dẫn code vào nhánh nào?](#bước-1-aspnetcore_environment-dẫn-code-vào-nhánh-nào)
+  - [Bước 2: AddDevelopmentEncryptionCertificate làm gì bên trong?](#bước-2-adddevelopmentencryptioncertificate-làm-gì-bên-trong)
+  - [Bước 3: Tại sao /home/appuser không tồn tại?](#bước-3-tại-sao-homeappuser-không-tồn-tại)
+- [Tại sao cờ EphemeralKeySet bắt buộc khi load cert từ file?](#tại-sao-cờ-ephemeralkeyset-bắt-buộc-khi-load-cert-từ-file)
+- [Fix cấp độ 1 — Docker lab / staging](#fix-cấp-độ-1--docker-lab--staging)
 - [Fix cấp độ 2 — Production thực sự](#fix-cấp-độ-2--production-thực-sự)
-- [Tại sao phải có cờ EphemeralKeySet?](#tại-sao-phải-có-cờ-ephemeralkeyset)
-- [Script tạo certificate self-signed](#script-tạo-certificate-self-signed)
-- [Cấu hình docker-compose cho Production](#cấu-hình-docker-compose-cho-production)
-- [Tóm tắt quyết định](#tóm-tắt-quyết-định)
+- [Hiểu điều gì thay đổi khi deploy version mới](#hiểu-điều-gì-thay-đổi-khi-deploy-version-mới)
+- [Tóm tắt quyết định theo môi trường](#tóm-tắt-quyết-định-theo-môi-trường)
+- [Checklist debug khi gặp lỗi](#checklist-debug-khi-gặp-lỗi-certificate-openiddict-trong-docker)
 
 ---
 
@@ -1363,74 +1365,217 @@ docker logs api --tail 30
 
 # PHẦN 5 — OpenIddict Certificate trong Docker: Nguyên nhân lỗi & Fix chuẩn
 
-> Lỗi: `Access to the path '/home/appuser' is denied` khi container `api` khởi động trong môi trường Production.
+> Lỗi: `Access to the path '/home/appuser' is denied` khi container `api` khởi động với `ASPNETCORE_ENVIRONMENT=Production`.
 
 ---
 
-## Chuỗi nguyên nhân — Tại sao lỗi xảy ra
+## Bức tranh tổng thể trước khi đọc chi tiết
 
-Lỗi này là **chuỗi nhân quả** của 3 quyết định kết hợp với nhau:
+Khi OpenIddict phát hành JWT token, nó cần **ký token đó** bằng một private key — giống như đóng dấu vào văn bản. Bên nhận dùng public key để xác minh dấu đó có thật không.
 
-```
-Dockerfile:
-  ENV ASPNETCORE_ENVIRONMENT=Production
-          │
-          ▼
-OpenIddictExtensions.cs — nhánh else:
-  options.AddDevelopmentEncryptionCertificate()
-         .AddDevelopmentSigningCertificate()
-          │
-          ▼ Hai method này làm gì?
-  1. Tạo self-signed X.509 certificate trong bộ nhớ
-  2. Cố LƯU certificate vào OS X.509 store để dùng lại sau restart
-          │
-          ▼ Trên Linux, OS X.509 store nằm ở đâu?
-  ~/.dotnet/corefx/cryptography/x509stores/
-  = /home/appuser/.dotnet/corefx/cryptography/x509stores/
-          │
-          ▼
-Dockerfile:
-  useradd -u 1001 -g appgroup -s /usr/sbin/nologin appuser
-  (KHÔNG có flag -m → /home/appuser KHÔNG tồn tại)
-          │
-          ▼
-  Access to the path '/home/appuser' is denied ← LỖI
-```
-
-### Tóm tắt 1 câu
-
-> `AddDevelopmentEncryptionCertificate()` sinh ra để dùng **trên máy dev Windows** (có profile user đầy đủ), không phải trong **container Linux non-root không có home directory**.
+Câu hỏi đặt ra: **private key đó lấy từ đâu và lưu ở đâu?** Đây chính là gốc rễ của vấn đề.
 
 ---
 
-## Tại sao AddDevelopmentEncryptionCertificate lại cố ghi file?
+## Chuỗi nguyên nhân từng bước
 
-Đây là điểm nhiều người hiểu nhầm. Tên có chữ "Development" nhưng lại **không giống AddEphemeralEncryptionKey**.
+### Bước 1: `ASPNETCORE_ENVIRONMENT=Production` dẫn code vào nhánh nào?
+
+Nhìn vào code:
+
+```csharp
+if (environment.IsDevelopment())   // ← kiểm tra biến môi trường này
+{
+    options.AddEphemeralEncryptionKey();   // Nhánh này chạy khi dev local
+}
+else                                       // ← mọi giá trị KHÁC Development đều vào đây
+{
+    options.AddDevelopmentEncryptionCertificate();  // ← đây là thủ phạm
+}
+```
+
+`IsDevelopment()` trả về `true` chỉ khi `ASPNETCORE_ENVIRONMENT = Development`. Mọi giá trị khác — `Production`, `Staging`, thậm chí `production` (chữ thường) — đều rơi vào `else`.
+
+Dockerfile đang đặt:
+
+```dockerfile
+ENV ASPNETCORE_ENVIRONMENT=Production
+```
+
+→ Container khởi động → code đi thẳng vào nhánh `else` → gọi `AddDevelopmentEncryptionCertificate()`.
+
+Để xác nhận điều này trên container đang chạy:
+
+```bash
+docker exec api printenv ASPNETCORE_ENVIRONMENT
+# Output: Production  ← xác nhận code đang chạy nhánh else
+```
+
+---
+
+### Bước 2: `AddDevelopmentEncryptionCertificate()` làm gì bên trong?
+
+Đây là điểm nhiều người hiểu nhầm. Tên có chữ "Development" nhưng nó **không phải** chỉ sinh key trong RAM như `AddEphemeral...`.
+
+Method này làm **2 việc**:
+
+```
+Việc A: Sinh self-signed X.509 certificate trong bộ nhớ (RAM)
+Việc B: Cố LƯU certificate đó xuống đĩa để dùng lại sau khi restart
+```
+
+Lý do tồn tại của Việc B: nếu chỉ lưu trong RAM, mỗi lần restart server thì key mới → toàn bộ token cũ không validate được → tất cả user bị logout. Method này giải quyết bằng cách persist cert xuống đĩa, lần sau restart thì đọc lại cert cũ.
+
+**Nghe có vẻ hợp lý — vậy nó lưu xuống đâu?**
+
+Trên **Linux**, .NET lưu certificate vào thư mục X.509 store của user hiện tại:
+
+```
+/home/{username}/.dotnet/corefx/cryptography/x509stores/my/
+```
+
+Với `appuser`, đường dẫn đầy đủ là:
+
+```
+/home/appuser/.dotnet/corefx/cryptography/x509stores/my/
+```
+
+Bảng so sánh 2 method:
 
 | Method | Sinh key ở đâu | Lưu key | Sau restart |
 |---|---|---|---|
-| `AddEphemeralEncryptionKey()` | RAM | Không lưu | Key mất, token cũ không validate được |
-| `AddDevelopmentEncryptionCertificate()` | RAM | **Cố lưu vào OS X.509 store** | Key còn (nếu lưu được) → token vẫn hợp lệ |
-
-`AddDevelopment...()` được thiết kế để: lần đầu chạy thì tạo cert và lưu vào store, lần sau restart thì đọc lại cert đó. Mục tiêu là giữ token hợp lệ qua nhiều restart trong khi dev — nhưng không dùng cert "thật" của production.
-
-Vấn đề: logic "lưu vào OS store" này **cần quyền ghi vào home directory** của user đang chạy process. Trên Windows dev machine thì user có đầy đủ quyền. Trên container Linux non-root không có `/home/appuser` thì lỗi.
+| `AddEphemeralEncryptionKey()` | RAM | Không lưu đi đâu | Key mất, token cũ không validate được |
+| `AddDevelopmentEncryptionCertificate()` | RAM | **Cố lưu vào `/home/user/.dotnet/...`** | Key còn → token vẫn hợp lệ |
 
 ---
 
-## Fix cấp độ 1 — Docker lab / staging (nhanh nhất)
+### Bước 3: Tại sao `/home/appuser` không tồn tại?
 
-Dùng khi: Docker lab, staging, CI/CD, môi trường test — chấp nhận token bị mất khi container restart.
+Nhìn vào Dockerfile:
 
-Không cần thay đổi gì ngoài code đã sửa. Logic fallback trong code đã xử lý:
-
-```csharp
-// Nếu không có OpenIddict:CertPath trong config → tự động dùng Ephemeral
-options.AddEphemeralEncryptionKey()
-       .AddEphemeralSigningKey();
+```dockerfile
+RUN groupadd -g 1001 appgroup \
+    && useradd -u 1001 -g appgroup -s /usr/sbin/nologin appuser \
+    ...
 ```
 
-**Hậu quả cần biết:** Khi container restart (deploy mới, `docker compose restart api`), tất cả access token và refresh token đang tồn tại **đều mất hiệu lực**. User phải đăng nhập lại. Chấp nhận được cho lab/staging, **không chấp nhận được cho production**.
+Lệnh `useradd` có 2 cách dùng:
+
+```bash
+# Không có -m → tạo user nhưng KHÔNG tạo /home/appuser
+useradd -u 1001 -g appgroup appuser
+
+# Có -m → tạo user VÀ tạo /home/appuser với đầy đủ quyền
+useradd -u 1001 -g appgroup -m appuser
+```
+
+Dockerfile dùng cách không có `-m` → `/home/appuser` **không tồn tại** trên filesystem container.
+
+---
+
+### Kết quả của chuỗi 3 bước trên
+
+```
+Container khởi động
+    → ASPNETCORE_ENVIRONMENT=Production → vào nhánh else
+        → AddDevelopmentEncryptionCertificate() được gọi
+            → Sinh cert trong RAM ✓
+            → Cố tạo thư mục /home/appuser/.dotnet/...
+                → /home/appuser không tồn tại (useradd không có -m)
+                    → "Access to the path '/home/appuser' is denied" ✗
+```
+
+> **Tóm tắt 1 câu:** `AddDevelopmentEncryptionCertificate()` được thiết kế cho máy dev Windows có profile user đầy đủ — không phải cho container Linux non-root không có home directory.
+
+---
+
+## Tại sao cờ EphemeralKeySet bắt buộc khi load cert từ file?
+
+Đây là chi tiết tinh tế nhất mà hầu hết hướng dẫn bỏ qua. Giả sử bạn đã fix bằng cách load cert từ file `.pfx`:
+
+```csharp
+// Trông có vẻ đúng...
+var cert = new X509Certificate2("/app/certs/openiddict.pfx", "password");
+```
+
+Nhưng **vẫn lỗi tương tự**. Tại sao?
+
+Khi `new X509Certificate2(path, password)` chạy, .NET không chỉ đọc file. Nó còn:
+
+```
+1. Đọc file .pfx → giải mã → lấy private key vào RAM ✓
+2. Tự động CỐ COPY private key vào OS key store
+   → trên Linux: /home/appuser/.dotnet/...
+   → /home/appuser không tồn tại → lại lỗi quyền ✗
+```
+
+Đây là hành vi mặc định kế thừa từ Windows CryptoAPI — vốn thiết kế để protect private key bằng cách lưu vào secure store có ACL. .NET trên Linux giả lập behavior này.
+
+**`EphemeralKeySet` tắt hành vi đó:**
+
+```csharp
+// ĐÚNG — giữ private key trong RAM, không cố ghi ra OS key store
+var cert = new X509Certificate2(
+    "/app/certs/openiddict.pfx",
+    "password",
+    X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.EphemeralKeySet
+    //                                  ↑ Nói với .NET: private key chỉ sống trong RAM process này
+);
+```
+
+| Flag | Ý nghĩa |
+|---|---|
+| `MachineKeySet` | Dùng machine store thay vì user store — tránh phụ thuộc vào home directory |
+| `EphemeralKeySet` | Giữ key trong RAM, không persist ra đĩa dù bằng bất kỳ cơ chế nào |
+
+```
+Không có EphemeralKeySet:
+  Đọc .pfx → key vào RAM → .NET cố copy vào /home/appuser/... → LỖI
+
+Có EphemeralKeySet:
+  Đọc .pfx → key vào RAM → xong, không làm gì thêm → OK
+```
+
+---
+
+## Fix cấp độ 1 — Docker lab / staging
+
+Dùng khi: Docker lab, staging, CI/CD — chấp nhận token bị mất khi container restart.
+
+Code đã có logic fallback tự động: nếu không có `OpenIddict:CertPath` trong config → dùng Ephemeral:
+
+```csharp
+else
+{
+    // Production: load cert từ file nếu có
+    var certPath = configuration["OpenIddict:CertPath"];
+
+    if (!string.IsNullOrEmpty(certPath) && File.Exists(certPath))
+    {
+        // ... load cert từ file
+    }
+    else
+    {
+        // Fallback: không có cert file → dùng Ephemeral
+        options.AddEphemeralEncryptionKey()
+               .AddEphemeralSigningKey();
+    }
+}
+```
+
+Với Docker lab (không mount cert file, không set env `OpenIddict__CertPath`) → `certPath` rỗng → tự động vào fallback → **không còn lỗi**.
+
+**Hậu quả cần biết:**
+
+```
+Kịch bản: deploy version mới → docker compose up → container restart
+  → Key mới được sinh trong RAM
+  → Tất cả access token và refresh token cũ KHÔNG hợp lệ
+  → User đang dùng app bị trả về 401 Unauthorized
+  → User phải đăng nhập lại
+```
+
+Chấp nhận được cho lab/staging (ít user test). Không chấp nhận được cho production (real users bị log out đồng loạt khi deploy).
 
 ---
 
@@ -1438,107 +1583,144 @@ options.AddEphemeralEncryptionKey()
 
 Dùng khi: môi trường production, user không được bị log out khi deploy.
 
-### Bước 1 — Tạo certificate
+### Bước 1 — Tạo certificate (làm 1 lần duy nhất)
+
+**Trên Windows dùng Git Bash hoặc WSL:**
 
 ```bash
-# Tạo RSA private key
-openssl genrsa -out openiddict.key 2048
+# Tạo thư mục chứa cert — sẽ KHÔNG commit lên git
+mkdir -p docker/certs
 
-# Tạo self-signed certificate (hạn 10 năm — cert này không phải TLS, chỉ ký token)
+# Sinh private key RSA 2048-bit
+openssl genrsa -out docker/certs/openiddict.key 2048
+
+# Tạo self-signed certificate hạn 10 năm
+# CN và O chỉ là metadata — đặt gì cũng được, cert này không phải TLS
 openssl req -new -x509 \
-  -key openiddict.key \
-  -out openiddict.crt \
+  -key docker/certs/openiddict.key \
+  -out docker/certs/openiddict.crt \
   -days 3650 \
-  -subj "/CN=OpenIddict Signing Cert/O=AuthDemo"
+  -subj "/CN=OpenIddict/O=AuthDemo"
 
-# Đóng gói thành .pfx (PKCS#12)
+# Đóng gói key + cert thành file .pfx có password bảo vệ
 openssl pkcs12 -export \
-  -out openiddict.pfx \
-  -inkey openiddict.key \
-  -in openiddict.crt \
-  -password pass:YourStrongPassword123
+  -out docker/certs/openiddict.pfx \
+  -inkey docker/certs/openiddict.key \
+  -in docker/certs/openiddict.crt \
+  -password pass:MyStrongPass2024
 ```
 
-> Cert này **không phải TLS certificate** (không dùng cho HTTPS). Nó chỉ ký JWT token. Dùng self-signed là hoàn toàn hợp lệ.
-
-### Bước 2 — Đặt cert vào thư mục an toàn
+Sau khi chạy xong, thư mục `docker/certs/` có 3 file:
 
 ```
-docker/
-  certs/
-    openiddict.pfx      ← file này
-  docker-compose.monitoring.yml
+docker/certs/
+  openiddict.key   ← private key (BẢO MẬT — không commit lên git)
+  openiddict.crt   ← certificate (public)
+  openiddict.pfx   ← gói cả 2 lại + password bảo vệ (đây là file dùng)
 ```
 
-> **Thêm vào .gitignore ngay**: `docker/certs/*.pfx` — không commit private key lên git.
+> Cert này **không phải TLS/HTTPS certificate**. Nó chỉ dùng để ký JWT token nội bộ. Dùng self-signed là hoàn toàn hợp lệ cho mục đích này.
 
-### Bước 3 — Mount cert vào docker-compose
+### Bước 2 — Thêm vào .gitignore ngay
+
+```bash
+echo "docker/certs/*.pfx" >> .gitignore
+echo "docker/certs/*.key" >> .gitignore
+echo "docker/certs/*.crt" >> .gitignore
+```
+
+File `.pfx` chứa private key — nếu commit lên GitHub là lộ key, bất kỳ ai cũng giả mạo được token.
+
+### Bước 3 — Tạo file `.env` chứa password (cũng không commit)
+
+```bash
+# docker/.env
+OPENIDDICT_CERT_PASSWORD=MyStrongPass2024
+```
+
+```bash
+echo "docker/.env" >> .gitignore
+```
+
+### Bước 4 — Mount cert vào docker-compose
 
 ```yaml
-# docker-compose.monitoring.yml
 services:
   api:
     volumes:
-      - ./certs/openiddict.pfx:/app/certs/openiddict.pfx:ro  # read-only
+      # Mount file .pfx vào container, chỉ đọc (:ro = read-only)
+      - ./certs/openiddict.pfx:/app/certs/openiddict.pfx:ro
     environment:
+      # Dấu __ trong tên env var = dấu : trong config C#
+      # OpenIddict__CertPath = configuration["OpenIddict:CertPath"] trong code
       - OpenIddict__CertPath=/app/certs/openiddict.pfx
-      - OpenIddict__CertPassword=YourStrongPassword123
+      - OpenIddict__CertPassword=${OPENIDDICT_CERT_PASSWORD}  # đọc từ file .env
 ```
 
-> Dấu `__` trong env var là cú pháp ASP.NET Core: `OpenIddict__CertPath` = `OpenIddict:CertPath` trong config.
+### Bước 5 — Verify sau khi deploy
 
-### Bước 4 — Code đọc cert (đã cập nhật trong OpenIddictExtensions.cs)
+```bash
+# Build và start
+docker compose -f docker-compose.monitoring.yml up -d --build
 
-```csharp
-var certPath = configuration["OpenIddict:CertPath"];
-var certPassword = configuration["OpenIddict:CertPassword"] ?? string.Empty;
+# Kiểm tra cert đã được mount vào container chưa
+docker exec api ls -la /app/certs/
+# Kết quả tốt:
+# -r--r--r-- 1 root root 2472 Jun 02 openiddict.pfx  ← có file, read-only
 
-if (!string.IsNullOrEmpty(certPath) && File.Exists(certPath))
-{
-    var cert = new X509Certificate2(certPath, certPassword,
-        X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.EphemeralKeySet);
-    options.AddEncryptionCertificate(cert)
-           .AddSigningCertificate(cert);
-}
+# Kiểm tra env var đã được đọc vào container chưa
+docker exec api printenv | grep OpenIddict
+# Kết quả tốt:
+# OpenIddict__CertPath=/app/certs/openiddict.pfx
+# OpenIddict__CertPassword=MyStrongPass2024
+
+# Xem log — phải KHÔNG còn lỗi "Access denied"
+docker logs api --tail 30
+# Kết quả tốt: thấy "Application started" mà không có exception
 ```
 
 ---
 
-## Tại sao phải có cờ EphemeralKeySet?
+## Hiểu điều gì thay đổi khi deploy version mới
 
-Đây là chi tiết quan trọng nhất mà hầu hết hướng dẫn bỏ qua.
-
-```csharp
-// SAI — vẫn cố ghi vào OS keystore dù đọc từ file
-var cert = new X509Certificate2(certPath, certPassword);
-
-// ĐÚNG — giữ private key trong RAM, không ghi ra đĩa
-var cert = new X509Certificate2(certPath, certPassword,
-    X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.EphemeralKeySet);
 ```
+Trước khi fix (Ephemeral hoặc AddDevelopmentCertificate thất bại):
+  Deploy → container restart → key mới sinh trong RAM
+  → Token cũ không hợp lệ → tất cả user bị logout đồng loạt
 
-Khi `X509Certificate2` constructor chạy, .NET mặc định cố persist private key vào OS key store — **ngay cả khi bạn đang đọc từ file**. Trên Linux container non-root, điều này lại gây ra lỗi tương tự như ban đầu.
-
-`EphemeralKeySet` nói với .NET: "giữ private key trong bộ nhớ process, không ghi ra đâu cả". Đây là cờ bắt buộc khi dùng certificate trong Linux container.
-
-| Flag | Ý nghĩa |
-|---|---|
-| `MachineKeySet` | Dùng machine store thay vì user store (tránh cần home directory) |
-| `EphemeralKeySet` | Giữ key trong RAM, không persist ra đĩa |
+Sau khi fix (cert file được mount):
+  Deploy → container restart → đọc cùng file openiddict.pfx → cùng private key
+  → Token cũ vẫn hợp lệ → user không bị logout
+```
 
 ---
 
-## Script tạo certificate self-signed
+## Tóm tắt quyết định theo môi trường
 
-Để tiện dùng, tạo file `docker/create-certs.sh`:
+```
+Môi trường                    │ Cấu hình                          │ Hậu quả khi restart
+──────────────────────────────│───────────────────────────────────│────────────────────
+Local dev (dotnet run)        │ IsDevelopment → AddEphemeral       │ Token mất — OK
+Docker lab / staging          │ Không có CertPath → AddEphemeral   │ Token mất — OK
+Docker production 1 instance  │ CertPath + cert file               │ Token giữ nguyên
+Docker production multi-inst  │ CertPath + cùng 1 cert file        │ Token giữ nguyên
+                              │ (mount cùng .pfx vào tất cả inst.) │ (dùng chung 1 key)
+```
+
+> **Quy tắc:** Chỉ quan tâm đến persistent cert khi user thật bị ảnh hưởng. Với lab/staging ít user test — ephemeral là đủ.
+
+---
+
+## Script tiện dụng — Tạo cert trong 1 lệnh
+
+Lưu thành `docker/create-certs.sh`, chạy 1 lần khi setup production:
 
 ```bash
 #!/bin/bash
-# Chạy 1 lần để tạo cert production
-# chmod +x create-certs.sh && ./create-certs.sh
+# Cách dùng: chmod +x create-certs.sh && ./create-certs.sh
 
 CERT_DIR="./certs"
-CERT_PASSWORD="ChangeThisPassword"
+CERT_PASSWORD="ChangeThisToStrongPassword"
 
 mkdir -p "$CERT_DIR"
 
@@ -1554,62 +1736,46 @@ openssl pkcs12 -export \
   -in "$CERT_DIR/openiddict.crt" \
   -password pass:$CERT_PASSWORD
 
-echo "Done: $CERT_DIR/openiddict.pfx (password: $CERT_PASSWORD)"
-echo "Add to .gitignore: docker/certs/*.pfx docker/certs/*.key docker/certs/*.crt"
+echo "Tạo xong: $CERT_DIR/openiddict.pfx"
+echo "Password: $CERT_PASSWORD"
+echo ""
+echo "Thêm vào .gitignore:"
+echo "  docker/certs/*.pfx"
+echo "  docker/certs/*.key"
+echo "  docker/certs/*.crt"
 ```
 
 ---
 
-## Cấu hình docker-compose cho Production
-
-```yaml
-services:
-  api:
-    # Không đặt ASPNETCORE_ENVIRONMENT ở đây nữa — đã set trong Dockerfile
-    volumes:
-      - ./certs/openiddict.pfx:/app/certs/openiddict.pfx:ro
-    environment:
-      # Dùng Docker secrets hoặc .env file thay vì hardcode password
-      - OpenIddict__CertPath=/app/certs/openiddict.pfx
-      - OpenIddict__CertPassword=${OPENIDDICT_CERT_PASSWORD}
-```
-
-Tạo file `.env` bên cạnh docker-compose (thêm vào `.gitignore`):
-
-```bash
-# docker/.env
-OPENIDDICT_CERT_PASSWORD=YourStrongPassword123
-```
-
----
-
-## Tóm tắt quyết định
+## Checklist debug khi gặp lỗi certificate OpenIddict trong Docker
 
 ```
-Môi trường                    │ Cấu hình                          │ Hậu quả khi restart
-──────────────────────────────│───────────────────────────────────│────────────────────
-Local dev (dotnet run)        │ IsDevelopment → AddEphemeral       │ Token mất — OK
-Docker lab / staging          │ Không có CertPath → AddEphemeral   │ Token mất — OK
-Docker production 1 instance  │ CertPath + cert file               │ Token giữ nguyên
-Docker production multi-inst  │ CertPath + cùng 1 cert file        │ Token giữ nguyên
-                              │ (mount cùng .pfx vào tất cả)       │ (tất cả instance dùng chung key)
-```
+Triệu chứng: container api không healthy, log có "Access to the path ... is denied"
 
-> **Quy tắc:** Chỉ quan tâm đến persistent cert khi user thật bị ảnh hưởng (restart = log out tất cả mọi người). Với lab/staging chạy 1–2 instance và ít user test, ephemeral là đủ.
+Bước 1 — Xác nhận môi trường:
+  docker exec api printenv ASPNETCORE_ENVIRONMENT
+  → "Production"? → code đang chạy nhánh else của OpenIddictExtensions.cs
 
----
+Bước 2 — Kiểm tra Dockerfile có tạo home directory không:
+  Mở Dockerfile → tìm dòng useradd
+  → Có flag -m không? Không có → /home/appuser không tồn tại
+  → Đây là lý do AddDevelopmentEncryptionCertificate() không ghi được
 
-### Checklist khi gặp lỗi certificate OpenIddict trong Docker
+Bước 3 — Kiểm tra code đang dùng method nào trong nhánh else:
+  Mở OpenIddictExtensions.cs → tìm nhánh else
+  → Đang dùng AddDevelopmentEncryptionCertificate()?
+  → Sửa thành: nếu có cert file thì load, không thì dùng Ephemeral
 
-```
-[ ] docker exec api printenv ASPNETCORE_ENVIRONMENT
-    → Production? → code chạy nhánh else
-[ ] Dockerfile có useradd -m không?
-    → Không có -m → /home/appuser không tồn tại
-[ ] Code dùng AddDevelopmentEncryptionCertificate() trong nhánh Production?
-    → Đây là nguyên nhân — sửa thành AddEphemeral hoặc load cert từ file
-[ ] Nếu load từ file: có cờ EphemeralKeySet không?
-    → Thiếu cờ này → vẫn cố ghi vào OS keystore → vẫn lỗi
-[ ] Cert file có được mount vào đúng path không?
-    → docker exec api ls -la /app/certs/
+Bước 4 — Nếu đã load cert từ file nhưng vẫn lỗi:
+  Kiểm tra có cờ EphemeralKeySet không:
+  var cert = new X509Certificate2(path, password,
+      X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.EphemeralKeySet);
+  → Thiếu cờ này: .NET vẫn cố ghi vào OS keystore dù đọc từ file → vẫn lỗi
+
+Bước 5 — Nếu đã có cờ nhưng cert không load được:
+  docker exec api ls -la /app/certs/
+  → File openiddict.pfx có ở đây không?
+  → Nếu không có: kiểm tra docker-compose volumes đã mount đúng chưa
+  docker exec api printenv | grep OpenIddict
+  → OpenIddict__CertPath và OpenIddict__CertPassword đã được set chưa?
 ```
