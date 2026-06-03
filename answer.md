@@ -1024,8 +1024,8 @@ Khi chạy load test với 1000 VU, target:
 **Mục đích:** Xác nhận script không lỗi, flow login → đọc sản phẩm → tạo đơn hàng hoạt động đúng. Không đánh giá performance.
 
 ```bash
-# Từ thư mục gốc project
-k6 run k6/smoke-test.js
+# Từ thư mục gốc project — gửi metrics vào InfluxDB để hiển thị trên Grafana
+k6 run --out influxdb=http://localhost:8086/k6 k6/smoke-test.js
 ```
 
 Nếu không cài k6 local, dùng Docker:
