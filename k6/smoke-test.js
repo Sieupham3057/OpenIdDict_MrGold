@@ -32,8 +32,14 @@ const BASE_URL = __ENV.BASE_URL || 'http://localhost:5000';
 const CLIENT_ID = __ENV.CLIENT_ID || 'angular-spa';
 
 const users = new SharedArray('users', function () {
-  return papaparse.parse(open('./users.csv'), { header: true }).data
+  // Strip UTF-8 BOM (﻿) if present — common when file is saved from Excel/Windows
+  const content = open('./users.csv').replace(/^﻿/, '');
+  const rows = papaparse.parse(content, { header: true, skipEmptyLines: true }).data
     .filter(u => u.username);
+  if (rows.length === 0) {
+    throw new Error('users.csv is empty or has no valid rows — check file encoding (should be UTF-8 without BOM)');
+  }
+  return rows;
 });
 
 export function setup() {
