@@ -3768,6 +3768,112 @@ services:
 
 ---
 
+<a id="q65b"></a>
+**Q65b. cAdvisor Dashboard 14282 — đọc và xử lý như thế nào?**
+
+```
+DASHBOARD: Grafana → Import ID 14282 "Cadvisor exporter"
+URL:       http://<server>:3000/d/pMEd7m0Mz/cadvisor-exporter
+FILTER:    Host = All | Container = docker-api (hoặc tên container cần xem)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PANEL 1: CPU Usage
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Metric: rate(container_cpu_usage_seconds_total[1m])
+Đơn vị: cores (0.5 = đang dùng 50% của 1 core)
+
+Đọc thế nào:
+  Flat line thấp (< 0.2 cores)  → API idle, bình thường
+  Spike ngắn khi nhận request   → bình thường
+  Sustained cao (> 0.8 cores)   → có vấn đề, cần điều tra
+
+Ngưỡng cần alert:
+  WARNING  : > 70% CPU limit liên tục > 5 phút
+  CRITICAL : > 90% CPU limit
+
+Nguyên nhân thường gặp:
+  ┌────────────────────────────────┬──────────────────────────────────┐
+  │ Triệu chứng                    │ Nguyên nhân có thể               │
+  ├────────────────────────────────┼──────────────────────────────────┤
+  │ CPU tăng đều theo traffic      │ Bình thường — cần scale           │
+  │ CPU cao nhưng traffic thấp     │ Background job, memory leak       │
+  │ CPU spike đột ngột rồi về      │ GC pressure, cold start           │
+  │ CPU 100% và không về           │ Infinite loop, deadlock           │
+  └────────────────────────────────┴──────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PANEL 2: Memory Usage
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Metrics:
+  Memory Usage  = container_memory_usage_bytes      (RSS + cache)
+  Memory Cached = container_memory_cache            (có thể được OS reclaim)
+
+Đọc thế nào:
+  Memory Usage tăng dần theo thời gian → Memory Leak!
+  Memory Usage tăng rồi về             → bình thường (GC)
+  Memory Cached cao                    → OK, là disk I/O cache
+
+Ngưỡng thực tế (.NET 8 API):
+  Baseline  : 150–300 MB (sau warm-up)
+  WARNING   : > 80% memory limit
+  CRITICAL  : > 90% memory limit → OOMKill sắp xảy ra
+
+Phân biệt Memory Leak vs bình thường:
+  Normal  : Usage tăng khi load cao → giảm sau khi GC → ổn định
+  Leak    : Usage tăng liên tục ngay cả khi traffic thấp, không giảm
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PANEL 3: Network I/O (nếu có)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Received cao bất thường → có client đang push data lớn hoặc DDoS
+  Transmitted cao          → response size lớn, kiểm tra payload
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WORKFLOW ĐIỀU TRA KHI CÓ INCIDENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Bước 1 — Xác định container bị ảnh hưởng (5 giây):
+   Container dropdown → chọn từng service → tìm cái nào spike
+
+Bước 2 — Phân loại vấn đề (30 giây):
+   CPU cao + Memory ổn → compute bottleneck → scale replicas
+   Memory tăng liên tục → memory leak → restart tạm + điều tra code
+   Cả CPU lẫn Memory cao → overload → scale hoặc circuit breaker
+
+Bước 3 — Đối chiếu với API metrics (Prometheus dotnet-api job):
+   CPU spike có khớp với P99 latency tăng không?
+   Nếu CPU thấp nhưng P99 cao → bottleneck ở DB, không phải CPU
+
+Bước 4 — Action:
+   Tạm thời: docker compose up -d --scale api=2
+   Dài hạn : tìm slow query, tối ưu code, thêm caching
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LƯU Ý TRIỂN KHAI (server dùng overlayfs / fuse-overlayfs)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Môi trường này dùng containerd integration thay Docker socket
+vì storage driver là overlayfs (không tương thích cAdvisor mặc định).
+
+Config đặc biệt trong docker-compose.monitoring.yml:
+  - image: gcr.io/cadvisor/cadvisor:v0.47.2
+  - volume: /run/containerd/containerd.sock
+  - flag: --containerd=/run/containerd/containerd.sock
+  - flag: --containerd-namespace=moby
+
+Container name trong dashboard = image name (không phải container_name):
+  docker-api  → container API (.NET 8)
+  prometheus  → Prometheus
+  grafana     → Grafana
+  influxdb    → InfluxDB
+  server      → SQL Server 2022
+```
+
+---
+
 <a id="q66"></a>
 **Q66. SLO, SLA, SLI — TechLead phải hiểu và cam kết với business như thế nào?**
 
