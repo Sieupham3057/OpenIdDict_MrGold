@@ -14,6 +14,9 @@
 - [Bước 1 — Khởi động toàn bộ stack](#bước-1--khởi-động-toàn-bộ-stack-api--monitoring)
 - [Bước 2 — Verify API hoạt động đúng](#bước-2--verify-api-hoạt-động-đúng)
 - [Bước 3 — Cấu hình Grafana](#bước-3--cấu-hình-grafana-làm-1-lần-duy-nhất)
+  - [3.4 Tìm dashboard & xem ngay không cần k6](#34-tìm-dashboard-sau-khi-import--xem-ngay-không-cần-k6)
+  - [3.5 Debug N/A theo từng dashboard](#35-tại-sao-dashboard-hiện-na--debug-theo-từng-dashboard)
+  - [3.6 Percentile P50/P95/P99](#36-percentile-là-gì-p50-p95-p99--đọc-như-thế-nào)
 - [Bước 4 — Chạy k6 từng giai đoạn](#bước-4--chạy-k6-từng-giai-đoạn)
   - [4.1 Smoke Test](#41-smoke-test--2-phút-2-vu-luôn-chạy-đầu-tiên)
   - [4.2 Load Test](#42-load-test--tải-bình-thường-13-phút)
@@ -68,6 +71,39 @@
 - [Các hàm PromQL cốt lõi](#các-hàm-promql-cốt-lõi-cần-biết)
 - [Làm sao biết metric nào tồn tại?](#làm-sao-biết-metric-nào-tồn-tại--tìm-ở-đâu)
 - [Tìm tài liệu ở đâu?](#tìm-tài-liệu-ở-đâu)
+
+**[Phần 7 — Crash Test & Scale Load Balancing Thực Tế](#phần-7--crash-test--scale-load-balancing-thực-tế)**
+- [Tổng quan kịch bản & IP Plan](#70-tổng-quan-kịch-bản--ip-plan)
+- [Giai đoạn 0 — Chuẩn bị VMware Workstation](#giai-đoạn-0--chuẩn-bị-vmware-workstation)
+- [Giai đoạn 1 — Deploy 1 máy + Crash Test](#giai-đoạn-1--deploy-1-máy--crash-test)
+  - [Step 1 — Tạo cert dùng chung](#step-1--tạo-cert-dùng-chung)
+  - [Step 2 — Cập nhật docker-compose dùng cert](#step-2--cập-nhật-docker-compose-dùng-cert)
+  - [Step 3 — Khởi động stack VM1](#step-3--khởi-động-toàn-bộ-stack-vm1)
+  - [Step 4 — Verify VM1 hoạt động đúng](#step-4--verify-vm1-hoạt-động-đúng)
+  - [Step 5 — Chạy Crash Test lần 1](#step-5--chạy-crash-test-lần-1-tìm-ngưỡng-chết)
+  - [Step 6 — Đọc kết quả & ghi ngưỡng](#step-6--đọc-kết-quả--ghi-ngưỡng-quan-trọng)
+- [Giai đoạn 2 — Setup VM2 trong VMware](#giai-đoạn-2--setup-vm2-trong-vmware)
+  - [Step 7 — Tạo VM2 trong VMware Workstation](#step-7--tạo-vm2-trong-vmware-workstation)
+  - [Step 8 — Cài Docker trên VM2](#step-8--cài-docker-trên-vm2)
+  - [Step 9 — Copy source code + cert sang VM2](#step-9--copy-source-code--cert-sang-vm2)
+  - [Step 10 — Khởi động API trên VM2](#step-10--khởi-động-api-trên-vm2)
+  - [Step 11 — Verify VM2 API healthy](#step-11--verify-vm2-api-healthy)
+- [Giai đoạn 3 — Setup Nginx Load Balancer trên VM1](#giai-đoạn-3--setup-nginx-load-balancer-trên-vm1)
+  - [Step 12 — Cấu hình nginx.conf với IP thực](#step-12--cấu-hình-nginxconf-với-ip-thực)
+  - [Step 13 — Khởi động Nginx LB](#step-13--khởi-động-nginx-lb)
+  - [Step 14 — Verify LB phân phối đến cả 2 node](#step-14--verify-lb-phân-phối-đến-cả-2-node)
+- [Giai đoạn 4 — Verify Token Cross-Instance](#giai-đoạn-4--verify-token-cross-instance)
+  - [Step 15 — Test token được chấp nhận trên cả 2 instance](#step-15--test-token-được-chấp-nhận-trên-cả-2-instance)
+- [Giai đoạn 5 — Crash Test 2 & So Sánh](#giai-đoạn-5--crash-test-2--so-sánh)
+  - [Step 16 — Update Prometheus scrape VM2](#step-16--update-prometheus-scrape-vm2)
+  - [Step 17 — Chạy Crash Test lần 2 qua Load Balancer](#step-17--chạy-crash-test-lần-2-qua-load-balancer)
+  - [Step 18 — Đọc và so sánh kết quả](#step-18--đọc-và-so-sánh-kết-quả)
+- [Bottleneck tiếp theo sau khi scale API](#bottleneck-tiếp-theo-sau-khi-scale-api)
+
+**[Phụ lục — Tóm tắt thay đổi code & infrastructure](#phụ-lục--tóm-tắt-thay-đổi-code--infrastructure)**
+- [Những file đã được tạo mới](#những-file-đã-được-tạo-mới)
+- [Những file đã được cập nhật](#những-file-đã-được-cập-nhật)
+- [Luồng triển khai toàn bộ](#luồng-triển-khai-toàn-bộ)
 
 ---
 
@@ -817,13 +853,12 @@ prometheus.yml hiện tại có:
 
 Dashboard 893 dùng metric dạng `node_cpu_seconds_total`, `node_memory_*`, `node_filesystem_*` — các metric này chỉ có từ node_exporter. Không có node_exporter → toàn bộ N/A.
 
-**Giải pháp — thêm node_exporter vào docker-compose:**
-
-Mở `docker/docker-compose.yml`, thêm service:
+**Giải pháp — thêm node_exporter vào `docker/docker-compose.monitoring.yml`:**
 
 ```yaml
   node-exporter:
     image: prom/node-exporter:latest
+    container_name: node-exporter
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
@@ -834,9 +869,10 @@ Mở `docker/docker-compose.yml`, thêm service:
       - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
     ports:
       - "9100:9100"
+    restart: unless-stopped
 ```
 
-Thêm vào `prometheus.yml`:
+Thêm vào `docker/prometheus/prometheus.yml`:
 
 ```yaml
   - job_name: 'node-exporter'
@@ -844,14 +880,176 @@ Thêm vào `prometheus.yml`:
       - targets: ['node-exporter:9100']
 ```
 
-Sau đó:
+Áp dụng (đứng trong thư mục `docker/`):
 
 ```bash
-docker compose up -d node-exporter
-docker compose restart prometheus
+# Khởi động node-exporter (không cần rebuild các service khác)
+docker compose -f docker-compose.monitoring.yml up -d node-exporter
+
+# Reload Prometheus config để nhận scrape job mới
+# Cách 1: restart container (luôn dùng được, không mất data vì volume)
+docker compose -f docker-compose.monitoring.yml restart prometheus
+
+# Cách 2: curl reload (chỉ dùng được nếu Prometheus đã có flag --web.enable-lifecycle)
+# Nếu gặp "Lifecycle API is not enabled" → dùng Cách 1
+curl -X POST http://localhost:9090/-/reload
 ```
 
-Đợi 10 giây → F5 dashboard 893 → panels hiện data.
+> **Lưu ý `Lifecycle API is not enabled`:** Prometheus mặc định tắt HTTP reload API. Cần thêm flag `--web.enable-lifecycle` vào `command:` trong docker-compose để dùng được lệnh curl:
+> ```yaml
+> command:
+>   - '--config.file=/etc/prometheus/prometheus.yml'
+>   - '--storage.tsdb.retention.time=7d'
+>   - '--web.enable-lifecycle'
+> ```
+> File `docker-compose.monitoring.yml` đã được cập nhật flag này. Sau lần `up` tiếp theo thì curl reload sẽ hoạt động.
+
+Đợi 15 giây → vào `http://192.168.1.35:9090` → Status → Targets → phải thấy `node-exporter` = **UP**.
+
+---
+
+##### Fix biến `Node` khi filter ⚠️ trống — node_exporter đã UP nhưng dashboard vẫn N/A
+
+**Nguyên nhân:** Dù node_exporter đã được Prometheus scrape, dashboard vẫn hiện N/A nếu biến `Node` ở đầu trang chưa được cấu hình datasource — **giống hệt vấn đề biến `instances` của dashboard 10915**.
+
+**Nhận biết:** Filter **Node** (hoặc **Container Group**) có icon ⚠️ đỏ và không có option nào để chọn, dù Prometheus target đang UP.
+
+**Cách fix — thao tác trong Grafana UI:**
+
+**Bước 1** — Mở dashboard settings:
+
+```
+Góc trên phải dashboard → click icon ✏ Edit → click icon ⚙ Settings
+```
+
+**Bước 2** — Vào Variables:
+
+```
+Sidebar trái trong Settings → chọn "Variables" → click vào biến "node" (hoặc "Node")
+```
+
+**Bước 3** — Trong section **Query options**, điền:
+
+| Field | Giá trị |
+|---|---|
+| **Data source** | Prometheus |
+| **Query type** | Label values |
+| **Label** | `instance` |
+| **Metric** | `up` |
+| **Label filter** | `job` = `node-exporter` |
+
+> ⚠️ Nhớ chọn **Query type = "Label values"** trước — nếu để "Select query type" thì Run query sẽ im lặng hoàn toàn (không báo lỗi, không có kết quả).
+
+**Bước 4** — Click **Run query** → **Preview of values** cuối trang hiện `192.168.1.35:9100` → click **Back to list** → **Save dashboard**
+
+**Bước 5** — Quay lại dashboard, chọn filter:
+
+```
+Filter Node ▾            → chọn "192.168.1.35:9100"
+Filter Container Group ▾ → chọn giá trị trong list (nếu có)
+```
+
+Dashboard tự reload → Uptime, Memory, Disk space, Load, Swap hiện data thực.
+
+> **Lưu ý biến `ContainerGroup`:** Nếu filter Container Group cũng có ⚠️, làm tương tự — Variables → click `containergroup` → Data source: Prometheus, Query type: Label values, Label: `container_label_com_docker_compose_service`, Metric: `container_last_seen`.
+
+---
+
+#### cAdvisor — `container_*` metrics hiện N/A: thiếu `privileged: true`
+
+**Nguyên nhân:** cAdvisor chạy **không có** `privileged: true` → không thể đọc `/proc/<pid>/` của các container ở tầng kernel → toàn bộ metric `container_cpu_usage_seconds_total`, `container_memory_usage_bytes`, `container_network_transmit_bytes_total`... trả về 0 hoặc không xuất hiện → Grafana hiện N/A.
+
+**Kiểm tra nhanh:**
+
+```bash
+# Nếu lệnh này không ra kết quả (hoặc toàn giá trị 0) → cAdvisor chưa có privileged
+curl http://192.168.1.35:8080/metrics | grep container_memory_usage_bytes | grep 'name="api"'
+
+# Kết quả đúng phải có số thực, ví dụ:
+# container_memory_usage_bytes{...name="api"...} 245760000
+```
+
+Hoặc vào Prometheus → Graph → gõ `container_memory_usage_bytes{name="api"}` → nếu không ra dòng nào → cAdvisor không collect được metrics.
+
+**Cách fix — `docker/docker-compose.monitoring.yml`:**
+
+```yaml
+cadvisor:
+  image: gcr.io/cadvisor/cadvisor:latest
+  container_name: cadvisor
+  privileged: true          # ← THÊM — cho phép đọc kernel /proc
+  devices:
+    - /dev/kmsg             # ← THÊM — đọc kernel ring buffer (OOM, throttle events)
+  ports:
+    - "8080:8080"
+  volumes:
+    - /:/rootfs:ro
+    - /var/run:/var/run:ro
+    - /sys:/sys:ro
+    - /var/lib/docker/:/var/lib/docker:ro
+  restart: unless-stopped
+```
+
+**Tại sao cần `privileged: true`?**
+
+Docker mặc định chặn container đọc `/proc` của container khác — đây là security sandbox. cAdvisor cần đọc `/proc/<pid>/cgroup`, `/proc/<pid>/net/dev`... của *mọi container* trên host để thu thập CPU, RAM, network. Không có `privileged: true`:
+- CPU metrics: trả về 0 liên tục
+- Memory metrics: không đọc được cgroup memory stats
+- Network I/O: không thấy interface của container
+- Tất cả Grafana panel dùng `container_*` → N/A
+
+**Tại sao cần `/dev/kmsg`?**
+
+cAdvisor đọc kernel ring buffer qua `/dev/kmsg` để theo dõi sự kiện OOM kill và CPU throttling. Thiếu device này → cAdvisor vẫn start được nhưng log lỗi `Failed to open /dev/kmsg` và một số metric bị thiếu trên kernel mới (Linux 5.x+).
+
+**Áp dụng fix:**
+
+```bash
+cd docker
+docker compose -f docker-compose.monitoring.yml up -d --force-recreate cadvisor
+```
+
+Đợi 15 giây → vào Prometheus → `container_memory_usage_bytes{name="api"}` → phải thấy số liệu thực.
+
+---
+
+#### Tổng hợp — 2 tầng metrics, 2 nguồn khác nhau
+
+> Dashboard 893 hiện N/A toàn bộ khi **thiếu 1 trong 2** nguồn dưới đây. Cần cả hai để dashboard hoạt động đầy đủ.
+
+| Tầng | Nguồn dữ liệu | Metric prefix | Panel trong dashboard 893 | Fix |
+|---|---|---|---|---|
+| **Container** (Docker) | **cAdvisor** | `container_*` | Containers count, CPU per container, Network per container | Thêm `privileged: true` + `/dev/kmsg` |
+| **Host** (OS / máy vật lý) | **node_exporter** | `node_*` | Uptime, Memory, Disk space, Load, Swap | Thêm service `node-exporter` vào compose |
+
+```
+Câu hỏi thực tế                         → Dùng nguồn nào?
+──────────────────────────────────────────────────────────
+"Container api đang dùng bao nhiêu RAM?" → cAdvisor  (container_memory_usage_bytes)
+"Máy host còn bao nhiêu RAM trống?"      → node_exporter (node_memory_MemAvailable_bytes)
+"Container api dùng bao nhiêu CPU?"      → cAdvisor  (container_cpu_usage_seconds_total)
+"Load average của máy host là bao nhiêu?"→ node_exporter (node_load1)
+"Disk của container đang dùng bao nhiêu?"→ node_exporter (node_filesystem_avail_bytes)
+"Có bao nhiêu container đang chạy?"      → cAdvisor  (container_last_seen)
+```
+
+**Verify cả 2 nguồn đều UP:**
+
+```bash
+# 1. Kiểm tra Prometheus đang scrape đủ 4 job
+curl -s http://192.168.1.35:9090/api/v1/targets | grep -o '"job":"[^"]*"' | sort -u
+# Kết quả mong đợi:
+# "job":"cadvisor"
+# "job":"dotnet-api"
+# "job":"node-exporter"
+
+# 2. Kiểm tra nhanh từng nguồn có data không
+curl -s 'http://192.168.1.35:9090/api/v1/query?query=node_memory_MemTotal_bytes' | grep -o '"value":\[[^]]*\]'
+# Phải ra số gigabytes thực, ví dụ: "value":[1748000000,"16765276160"]
+
+curl -s 'http://192.168.1.35:9090/api/v1/query?query=container_memory_usage_bytes{name="api"}' | grep -o '"value":\[[^]]*\]'
+# Phải ra số bytes thực, ví dụ: "value":[1748000000,"245760000"]
+```
 
 ---
 
@@ -2689,3 +2887,1239 @@ CPU container (qua Docker)         │ rate(container_cpu_usage_seconds_total{na
 RAM container (qua Docker)         │ container_memory_working_set_bytes{name="api"}
 API có còn sống không              │ up{job="dotnet-api"} (1=UP, 0=DOWN)
 ```
+
+---
+
+---
+
+# PHẦN 7 — Crash Test & Scale Load Balancing Thực Tế
+
+> **Mục tiêu:** Tìm ngưỡng chết của 1 instance trên VM1 → deploy thêm VM2 trong VMware → setup Nginx LB → chạy lại cùng bài test → so sánh kết quả.
+>
+> **Kịch bản:** Máy bạn chạy VMware Workstation. Tất cả VM trong dải `192.168.1.*`. VM1 đã có sẵn, VM2 sẽ tạo mới.
+
+---
+
+## 7.0 Tổng quan kịch bản & IP Plan
+
+```
+GIAI ĐOẠN 1 — 1 máy:
+
+  k6 (laptop/VM)
+       │
+       ▼ port 5000
+  ┌─────────────────────────────────┐
+  │  VM1 — 192.168.1.35             │
+  │  ┌─────────────────────────┐    │
+  │  │  Docker Compose         │    │
+  │  │  ├─ api       :5000     │    │
+  │  │  ├─ prometheus:9090     │    │
+  │  │  ├─ grafana   :3000     │    │
+  │  │  ├─ influxdb  :8086     │    │
+  │  │  └─ cadvisor  :8080     │    │
+  │  └─────────────────────────┘    │
+  │  SQL Server (Windows host)      │
+  └─────────────────────────────────┘
+
+
+GIAI ĐOẠN 2 — 2 máy + Load Balancer:
+
+  k6 (laptop/VM)
+       │
+       ▼ port 80
+  ┌───────────────────────────────────────────────────────┐
+  │  VM1 — 192.168.1.35                                   │
+  │  ┌────────────────────────────────────────────────┐   │
+  │  │  nginx-lb (port 80) ← entry point duy nhất     │   │
+  │  │       │                    │                   │   │
+  │  │  api:5000 (VM1)    192.168.1.36:5000 (VM2)     │   │
+  │  │  + monitoring stack                            │   │
+  │  └────────────────────────────────────────────────┘   │
+  │  SQL Server ← cả 2 instance cùng kết nối vào đây      │
+  └───────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────┐
+  │  VM2 — 192.168.1.36     │
+  │  ├─ Docker: api :5000   │
+  │  └─ (không monitoring)  │
+  └─────────────────────────┘
+```
+
+**IP Plan (thay theo mạng thực của bạn):**
+
+| Máy | IP | Role |
+|---|---|---|
+| VM1 | `192.168.1.35` | API + Monitoring + Nginx LB + SQL Server |
+| VM2 | `192.168.1.36` | API instance thứ 2 (không có monitoring) |
+| Laptop/máy test | Bất kỳ trong dải | Chạy k6 |
+
+**Files đã có trong repo:**
+
+| File | Mục đích |
+|---|---|
+| [k6/crash-test.js](k6/crash-test.js) | Script crash test — tăng VU đến 2000 |
+| [docker/nginx.conf](docker/nginx.conf) | Cấu hình Nginx LB |
+| [docker/docker-compose.lb.yml](docker/docker-compose.lb.yml) | Service nginx-lb cho VM1 |
+| [docker/docker-compose.node2.yml](docker/docker-compose.node2.yml) | Stack API-only cho VM2 |
+| [docker/create-certs.sh](docker/create-certs.sh) | Script tạo cert .pfx dùng chung |
+| [docker/prometheus/prometheus.yml](docker/prometheus/prometheus.yml) | Đã có comment để bật scrape VM2 |
+
+---
+
+## Giai đoạn 0 — Chuẩn bị VMware Workstation
+
+> Nếu VM1 đã chạy sẵn và bạn chỉ cần tạo VM2, bỏ qua bước này và đi thẳng vào **Giai đoạn 1**.
+
+### Network Mode: Bridged (bắt buộc để lấy IP 192.168.1.*)
+
+Trong VMware Workstation:
+
+```
+Edit → Virtual Network Editor → VMnet0
+  → Chọn "Bridged" → Automatic (hoặc chọn card mạng vật lý của bạn)
+```
+
+Với mỗi VM:
+```
+VM Settings → Network Adapter → Bridged (Replicate physical network connection state)
+```
+
+Sau khi vào VM, verify IP đúng dải:
+```bash
+ip addr show | grep "inet 192"
+# Phải thấy: inet 192.168.1.XX/24
+```
+
+> Nếu không thấy IP 192.168.1.* mà thấy 172.x.x.x → đang dùng NAT, không phải Bridged.
+> Đổi lại sang Bridged và restart VM.
+
+### Specs khuyên dùng cho từng VM
+
+| | VM1 | VM2 |
+|---|---|---|
+| OS | Ubuntu Server 22.04 LTS | Ubuntu Server 22.04 LTS |
+| CPU | 2–4 cores | 2–4 cores |
+| RAM | 8–12 GB (SQL Server cần ~4–6 GB) | 4–6 GB |
+| Disk | 40–80 GB | 20–40 GB |
+| Network | Bridged | Bridged |
+
+> **Tip VMware:** Snapshot VM1 trước khi bắt đầu — nếu có lỗi bạn có thể rollback nhanh mà không cần cài lại.
+
+---
+
+## Giai đoạn 1 — Deploy 1 máy + Crash Test
+
+> Tất cả lệnh trong giai đoạn này chạy trên **VM1**.
+
+### Step 1 — Tạo cert dùng chung
+
+Cert này sẽ dùng chung cho cả VM1 và VM2. Tạo 1 lần duy nhất trên VM1.
+
+**Tại sao cần cert file?** Nếu dùng Ephemeral key (mặc định khi chạy 1 instance), mỗi instance tự sinh key riêng trong RAM. Khi scale lên 2 instance:
+
+```
+VM1 sinh key A (trong RAM)
+VM2 sinh key B (trong RAM, khác A)
+
+Token được ký bởi VM1 (key A)
+  → Request đến VM2 → VM2 dùng key B để verify → FAIL 401
+
+Kết quả trong k6: error rate ~50%, lỗi ngẫu nhiên, cực kỳ khó debug
+```
+
+**Giải pháp:** Cả 2 instance dùng cùng 1 file `.pfx`:
+
+```bash
+# Trên VM1, từ thư mục gốc project
+cd ~/projects/OpenIdDict_MrGold/docker
+
+chmod +x create-certs.sh
+./create-certs.sh "OpenIddict@2024"
+```
+
+Output kỳ vọng:
+```
+[1/3] Sinh RSA 2048-bit private key...
+[2/3] Tạo self-signed certificate (10 năm)...
+[3/3] Đóng gói thành .pfx...
+
+Tạo xong: ./certs/openiddict.pfx
+  Password: OpenIddict@2024
+```
+
+Bảo vệ cert (KHÔNG commit lên git):
+```bash
+echo "docker/certs/" >> ../.gitignore
+```
+
+Tạo file `.env` để docker-compose đọc password:
+```bash
+echo "OPENIDDICT_CERT_PASSWORD=OpenIddict@2024" > .env
+```
+
+---
+
+### Step 2 — Cập nhật docker-compose dùng cert
+
+Mở [docker/docker-compose.monitoring.yml](docker/docker-compose.monitoring.yml), tìm service `api` và thêm:
+
+```yaml
+  api:
+    # ... giữ nguyên các dòng hiện tại ...
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=...
+      # ↓ THÊM 2 dòng này
+      - OpenIddict__CertPath=/app/certs/openiddict.pfx
+      - OpenIddict__CertPassword=${OPENIDDICT_CERT_PASSWORD}
+    volumes:
+      - api-logs:/app/logs
+      # ↓ THÊM dòng này
+      - ./certs/openiddict.pfx:/app/certs/openiddict.pfx:ro
+```
+
+---
+
+### Step 3 — Khởi động toàn bộ stack VM1
+
+```bash
+# Từ thư mục docker/
+cd ~/projects/OpenIdDict_MrGold/docker
+
+# Lần đầu: build image + khởi động
+docker compose -f docker-compose.monitoring.yml up -d --build
+
+# Lần sau (không thay đổi code): bỏ --build
+docker compose -f docker-compose.monitoring.yml up -d
+```
+
+Chờ ~2–3 phút, kiểm tra trạng thái:
+```bash
+docker compose -f docker-compose.monitoring.yml ps
+```
+
+Kết quả kỳ vọng:
+```
+NAME         STATUS
+api          running (healthy)
+prometheus   running (healthy)
+grafana      running (healthy)
+influxdb     running (healthy)
+cadvisor     running
+```
+
+Nếu `api` bị `Exited` → xem log nguyên nhân:
+```bash
+docker logs api --tail 30
+```
+
+---
+
+### Step 4 — Verify VM1 hoạt động đúng
+
+**4a. Verify cert được load (không phải Ephemeral fallback):**
+
+```bash
+docker logs api --tail 20 | grep -iE "(cert|error|access denied|started)"
+# Tốt: thấy "Application started" và KHÔNG thấy "Access to the path"
+
+docker exec api printenv | grep OpenIddict
+# Kết quả tốt:
+# OpenIddict__CertPath=/app/certs/openiddict.pfx
+# OpenIddict__CertPassword=OpenIddict@2024
+```
+
+**4b. Verify các endpoint cần thiết:**
+
+```bash
+# 1. Health check
+curl http://192.168.1.35:5000/health
+# Kỳ vọng: {"status":"Healthy"}
+
+# 2. Metrics endpoint — Prometheus scrape cái này mỗi 5 giây
+curl http://192.168.1.35:5000/metrics | head -5
+# Kỳ vọng: thấy # HELP ... # TYPE ...
+
+# 3. Thử login với test user
+curl -s -X POST http://192.168.1.35:5000/connect/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=password&client_id=angular-spa&username=loadtest_001@test.com&password=TestPass@123&scope=openid profile email roles" \
+  | jq .access_token
+# Kỳ vọng: chuỗi JWT dài (eyJ...)
+```
+
+**4c. Verify Prometheus đang scrape API:**
+
+```
+Mở: http://192.168.1.35:9090 → Status → Targets
+→ dotnet-api: State = UP (màu xanh)
+```
+
+**4d. Cấu hình Grafana (làm 1 lần):**
+
+> Xem hướng dẫn chi tiết tại **Bước 3 — Cấu hình Grafana** trong Phần 2.
+>
+> Tóm tắt nhanh: Add datasource InfluxDB (URL: `http://192.168.1.35:8086`, DB: `k6`) + datasource Prometheus (`http://prometheus:9090`) → Import 3 dashboard: **2587**, **10915**, **893**.
+
+**4e. Mở SSMS và chuẩn bị query monitoring SQL:**
+
+```sql
+-- Query 1: Top query chậm đang chạy (chạy lại nhiều lần trong khi test)
+SELECT TOP 10
+    r.session_id, r.status, r.wait_type,
+    r.wait_time / 1000.0 AS wait_sec,
+    r.total_elapsed_time / 1000.0 AS elapsed_sec,
+    r.logical_reads,
+    SUBSTRING(t.text, (r.statement_start_offset/2)+1,
+        ((CASE r.statement_end_offset WHEN -1 THEN DATALENGTH(t.text)
+          ELSE r.statement_end_offset END - r.statement_start_offset)/2)+1) AS query_text
+FROM sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+WHERE r.session_id > 50
+ORDER BY r.total_elapsed_time DESC;
+
+-- Query 2: Số connection đang mở
+SELECT DB_NAME(dbid) AS db, COUNT(*) AS connections
+FROM sys.sysprocesses WHERE dbid > 0
+GROUP BY dbid ORDER BY connections DESC;
+```
+
+---
+
+### Step 5 — Chạy Crash Test lần 1 (tìm ngưỡng chết)
+
+> Crash test chạy ~12 phút. Trong lúc đó mở Grafana song song để xem trực tiếp.
+
+Mở 3 cửa sổ/tab song song:
+
+```
+Cửa sổ 1 — Terminal: chạy k6
+Cửa sổ 2 — Grafana dashboard 2587 (k6): xem VU, p95, error rate
+Cửa sổ 3 — Grafana dashboard 10915 (.NET): chọn instance "api:8080" → xem CPU, GC, Heap
+```
+
+Chạy crash test:
+
+```bash
+# Từ thư mục gốc project (không phải docker/)
+cd ~/projects/OpenIdDict_MrGold
+
+# Nếu đã cài k6 trên VM1
+k6 run \
+  --out influxdb=http://192.168.1.35:8086/k6 \
+  --env BASE_URL=http://192.168.1.35:5000 \
+  k6/crash-test.js
+```
+
+Nếu chưa cài k6, dùng Docker:
+```bash
+docker run --rm -i \
+  --network host \
+  -v ${PWD}/k6:/scripts \
+  grafana/k6 run \
+    --out influxdb=http://192.168.1.35:8086/k6 \
+    --env BASE_URL=http://192.168.1.35:5000 \
+    /scripts/crash-test.js
+```
+
+Hoặc chạy k6 từ laptop (nếu laptop trong cùng mạng 192.168.1.*):
+```bash
+# Trên laptop có k6
+k6 run \
+  --out influxdb=http://192.168.1.35:8086/k6 \
+  --env BASE_URL=http://192.168.1.35:5000 \
+  k6/crash-test.js
+```
+
+---
+
+### Step 6 — Đọc kết quả & ghi ngưỡng quan trọng
+
+**6 giai đoạn bạn sẽ thấy trong Grafana khi VU tăng dần:**
+
+```
+══════════════════════════════════════════════════════════════════
+Giai đoạn 1 — HEALTHY (0 → 200 VU, ~0–3 phút đầu)
+══════════════════════════════════════════════════════════════════
+  Grafana 2587:
+    ● Virtual Users: tăng đều
+    ● p95 latency:   < 300ms  ← API xử lý kịp
+    ● Error rate:    0%
+
+  Grafana 10915 (chọn instance api:8080):
+    ● CPU:           < 40%
+    ● GC Gen0:       tăng bình thường (đây là bình thường)
+    ● Thread Pool Queue: = 0
+
+  k6 terminal:
+    ✓ login ok:     100%
+    ✓ products ok:  100%
+
+══════════════════════════════════════════════════════════════════
+Giai đoạn 2 — DEGRADED (200 → 600 VU, ~3–6 phút)
+══════════════════════════════════════════════════════════════════
+  Grafana 2587:
+    ● p95 latency:  500ms → 2s  ← TĂNG NHANH = điểm "knee"
+    ● Error rate:   0.5–3%
+
+  Grafana 10915:
+    ● CPU:          60–85%
+    ● GC Gen2:      bắt đầu tăng
+    ● Thread Pool Queue: > 0 đôi lúc
+
+  ⚠️ GHI LẠI: số VU khi p95 vượt 1s = _____ VU
+              đây là "ngưỡng degraded" của hệ thống
+
+══════════════════════════════════════════════════════════════════
+Giai đoạn 3 — COLLAPSE (600 → 1500+ VU, ~6–9 phút)
+══════════════════════════════════════════════════════════════════
+  Grafana 2587:
+    ● p95 latency:  > 10s  ← server treo
+    ● Error rate:   > 30%
+    ● Request rate: giảm (k6 không gửi kịp vì timeout)
+
+  Grafana 10915:
+    ● CPU:          100% liên tục
+    ● GC Gen2:      tăng không ngừng
+    ● Heap:         tăng không dừng sau GC
+
+  k6 terminal:
+    ✗ login ok:     < 50%  ← quá nửa login thất bại
+
+  ⚠️ GHI LẠI: số VU khi error rate vượt 30% = _____ VU
+              đây là "ngưỡng collapse"
+
+══════════════════════════════════════════════════════════════════
+Giai đoạn 4 — RAMP DOWN (VU → 0, ~9–12 phút)
+══════════════════════════════════════════════════════════════════
+  Kịch bản A — Self-recover (tốt):
+    Sau 30–60s khi VU = 0 → p95 giảm về < 500ms
+    → Hệ thống tự hồi phục, không cần can thiệp
+
+  Kịch bản B — Không recover (cần xử lý):
+    VU = 0 nhưng error rate vẫn > 0, p95 vẫn cao
+    → Connection pool bị kẹt hoặc GC đang làm việc nặng
+    → Chạy: docker restart api
+    → Sau đó chờ 30s → verify health lại
+```
+
+**Output k6 terminal mẫu khi hệ thống collapse:**
+
+```
+✗ login ok............: 41.2%  ✓ 8234   ✗ 11766
+✗ products ok.........: 38.7%
+✗ order ok............: 22.1%  ✓ 3340   ✗ 11720
+
+crash_login_ok........: 41.20%   ← giảm từ 100%
+crash_timeout.........: 31.40%   ← 31% request không nhận được response trong 20s
+crash_5xx.............: 18.30%   ← 18% nhận 500/503
+
+http_req_duration......: avg=12.3s  p(50)=9.8s  p(95)=28.1s
+http_req_failed........: 58.80%
+http_req_blocked.......: avg=4.2s   ← chờ TCP connection cực lâu → pool cạn
+
+vus....................: 1847  max=2000
+```
+
+**Điền vào bảng trước khi chuyển giai đoạn 2:**
+
+```
+╔══════════════════════════════════════════════════════╗
+║  KẾT QUẢ CRASH TEST 1 (1 INSTANCE)                  ║
+╠══════════════════════════════════════════════════════╣
+║  Ngưỡng degraded (p95 > 1s):    _____ VU            ║
+║  Ngưỡng collapse (error > 30%): _____ VU            ║
+║  Max throughput:                _____ req/s          ║
+║  p95 latency tại 300 VU:        _____ ms            ║
+║  Self-recover sau khi hạ tải:   CÓ / KHÔNG          ║
+╚══════════════════════════════════════════════════════╝
+```
+
+---
+
+## Giai đoạn 2 — Setup VM2 trong VMware
+
+### Step 7 — Tạo VM2 trong VMware Workstation
+
+**7a. Tạo VM mới:**
+
+```
+VMware Workstation → File → New Virtual Machine
+  → Typical (Recommended) → Next
+  → Installer disc image file (iso) → chọn file Ubuntu 22.04 Server .iso
+  → Next → đặt tên VM: "OpenIdDict-Node2"
+  → Disk size: 30 GB → Store as single file
+  → Customize Hardware:
+      Memory: 4096 MB (4 GB)
+      Processors: 2 cores
+      Network Adapter: Bridged (Replicate physical connection)
+  → Finish
+```
+
+**7b. Cài Ubuntu Server 22.04:**
+
+```
+Trong quá trình cài đặt:
+  - Language: English
+  - Keyboard: English (US)
+  - Ubuntu Server (không cần Ubuntu Server minimized)
+  - Network: để tự lấy DHCP → sau đó set IP tĩnh
+  - Disk: Use entire disk → Done
+  - Profile: đặt username và password (ví dụ: user / password)
+  - Install OpenSSH server: ✓ Bật (để SSH từ VM1 sang)
+  - Featured server snaps: bỏ qua tất cả → Done
+  - Chờ cài xong → Reboot
+```
+
+**7c. Set IP tĩnh cho VM2 (quan trọng — không để DHCP):**
+
+```bash
+# Sau khi login vào VM2
+sudo nano /etc/netplan/00-installer-config.yaml
+```
+
+Sửa thành:
+```yaml
+network:
+  version: 2
+  ethernets:
+    ens33:                          # Kiểm tra tên interface: ip link show
+      dhcp4: no
+      addresses:
+        - 192.168.1.36/24           # IP tĩnh cho VM2
+      gateway4: 192.168.1.1         # Gateway của mạng bạn
+      nameservers:
+        addresses: [8.8.8.8, 8.8.4.4]
+```
+
+```bash
+sudo netplan apply
+
+# Verify IP
+ip addr show
+# Phải thấy: inet 192.168.1.36/24
+
+# Test kết nối đến VM1
+ping 192.168.1.35 -c 3
+# Phải thấy reply
+```
+
+> **Tên interface có thể khác:** Dùng `ip link show` để xem tên thực tế (thường là `ens33`, `ens32`, `eth0`, hoặc `enp0s3`).
+
+---
+
+### Step 8 — Cài Docker trên VM2
+
+```bash
+# Chạy trên VM2
+# Cài Docker Engine (không phải Docker Desktop)
+curl -fsSL https://get.docker.com | sudo sh
+
+# Thêm user hiện tại vào group docker (không cần sudo mỗi lần)
+sudo usermod -aG docker $USER
+
+# Logout và login lại để group có hiệu lực
+exit
+# → SSH lại vào VM2
+
+# Verify Docker hoạt động
+docker run hello-world
+# Phải thấy "Hello from Docker!"
+
+docker compose version
+# Phải thấy Docker Compose version 2.x.x
+```
+
+---
+
+### Step 9 — Copy source code + cert sang VM2
+
+> Chạy các lệnh này từ **VM1**, SSH sang VM2.
+
+**9a. Copy toàn bộ source code:**
+
+```bash
+# Trên VM1
+# Thay "user" bằng username trên VM2
+# Thay 192.168.1.36 bằng IP thực của VM2
+
+scp -r ~/projects/OpenIdDict_MrGold user@192.168.1.36:~/projects/
+```
+
+Hoặc nếu chưa có git trên VM2:
+```bash
+# Trên VM2 — clone từ git repo
+sudo apt install -y git
+git clone <repo-url> ~/projects/OpenIdDict_MrGold
+```
+
+**9b. Copy cert sang VM2 (QUAN TRỌNG):**
+
+```bash
+# Trên VM1
+# Tạo thư mục certs trên VM2
+ssh user@192.168.1.36 "mkdir -p ~/projects/OpenIdDict_MrGold/docker/certs"
+
+# Copy file cert
+scp docker/certs/openiddict.pfx user@192.168.1.36:~/projects/OpenIdDict_MrGold/docker/certs/
+
+# Verify
+ssh user@192.168.1.36 "ls -la ~/projects/OpenIdDict_MrGold/docker/certs/"
+# Phải thấy: openiddict.pfx
+```
+
+**9c. Tạo file .env trên VM2:**
+
+```bash
+# Trên VM2
+cd ~/projects/OpenIdDict_MrGold/docker
+echo "OPENIDDICT_CERT_PASSWORD=OpenIddict@2024" > .env
+
+# Verify
+cat .env
+# OPENIDDICT_CERT_PASSWORD=OpenIddict@2024
+```
+
+**9d. Cập nhật connection string trỏ vào SQL Server trên VM1:**
+
+Mở [docker/docker-compose.node2.yml](docker/docker-compose.node2.yml), kiểm tra phần `ConnectionStrings__DefaultConnection`:
+
+```yaml
+environment:
+  - ConnectionStrings__DefaultConnection=Server=192.168.1.35,1433;Database=OpenIdDict;...
+```
+
+> SQL Server chạy trên VM1 (`192.168.1.35`). VM2 phải dùng IP này, không phải `localhost`.
+
+---
+
+### Step 10 — Khởi động API trên VM2
+
+```bash
+# Trên VM2
+cd ~/projects/OpenIdDict_MrGold/docker
+
+# Build và chạy (lần đầu mất ~3–5 phút)
+docker compose -f docker-compose.node2.yml up -d --build
+```
+
+Theo dõi log:
+```bash
+docker logs api --follow
+```
+
+Chờ thấy **cả 2 dòng** sau rồi Ctrl+C:
+```
+[INF] Checking database migration status...
+[INF] Database already up-to-date, skipping migration.    ← DB đã migrate từ VM1
+[INF] Users already exist, skipping seed.                  ← Users đã có từ VM1
+[INF] Application started. Press Ctrl+C to shut down.
+```
+
+Nếu thấy lỗi sau:
+```
+# Lỗi kết nối SQL: timeout / refused
+→ Kiểm tra firewall trên VM1 cho phép port 1433
+→ Trên VM1: sudo ufw allow 1433 (nếu dùng ufw)
+→ Hoặc: SQL Server phải bind 0.0.0.0, không phải chỉ localhost
+
+# Lỗi cert: "Access to the path is denied"
+→ File .pfx chưa copy hoặc quyền sai
+→ ls -la docker/certs/openiddict.pfx
+→ chmod 644 docker/certs/openiddict.pfx
+```
+
+---
+
+### Step 11 — Verify VM2 API healthy
+
+```bash
+# Từ VM1 hoặc laptop (kiểm tra VM2 accessible từ bên ngoài)
+curl http://192.168.1.36:5000/health
+# {"status":"Healthy"}
+
+curl http://192.168.1.36:5000/metrics | head -5
+# # HELP ... # TYPE ... → metrics đang expose
+
+# Test login trực tiếp vào VM2
+curl -s -X POST http://192.168.1.36:5000/connect/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=password&client_id=angular-spa&username=loadtest_001@test.com&password=TestPass@123&scope=openid profile email roles" \
+  | jq -r '.access_token | .[0:60]'
+# Phải thấy chuỗi JWT (eyJ...)
+```
+
+---
+
+## Giai đoạn 3 — Setup Nginx Load Balancer trên VM1
+
+### Step 12 — Cấu hình nginx.conf với IP thực
+
+Mở [docker/nginx.conf](docker/nginx.conf), sửa IP VM2:
+
+```nginx
+upstream api_backend {
+    least_conn;                                         # Chia đều connection (không phải request)
+    server 192.168.1.35:5000 max_fails=3 fail_timeout=30s;  # VM1 — API instance 1
+    server 192.168.1.36:5000 max_fails=3 fail_timeout=30s;  # VM2 — đổi IP này
+    keepalive 64;
+}
+```
+
+> `least_conn` tốt hơn `round_robin` mặc định: khi VM1 đang xử lý request lâu (GC pause), Nginx sẽ chuyển request sang VM2 thay vì tiếp tục gửi vào VM1 đang bận.
+
+---
+
+### Step 13 — Khởi động Nginx LB
+
+```bash
+# Trên VM1
+cd ~/projects/OpenIdDict_MrGold/docker
+
+docker compose -f docker-compose.monitoring.yml \
+               -f docker-compose.lb.yml up -d nginx-lb
+```
+
+Kiểm tra:
+```bash
+docker ps | grep nginx-lb
+# nginx-lb   Up X seconds (healthy)
+```
+
+---
+
+### Step 14 — Verify LB phân phối đến cả 2 node
+
+**14a. Health check qua LB:**
+
+```bash
+curl http://192.168.1.35/lb-health
+# nginx-lb-ok
+```
+
+**14b. Gọi nhiều lần, xem log Nginx để thấy request đến cả 2 node:**
+
+```bash
+# Gọi 10 lần qua LB
+for i in {1..10}; do
+  curl -s http://192.168.1.35/health
+  echo ""
+done
+
+# Xem Nginx access log
+docker logs nginx-lb --tail 20
+```
+
+Kết quả log mong đợi (thấy 2 upstream IP xen kẽ):
+```
+192.168.1.100 - "GET /health" 200 - 0.013s "upstream: 192.168.1.35:5000"
+192.168.1.100 - "GET /health" 200 - 0.015s "upstream: 192.168.1.36:5000"
+192.168.1.100 - "GET /health" 200 - 0.012s "upstream: 192.168.1.35:5000"
+192.168.1.100 - "GET /health" 200 - 0.014s "upstream: 192.168.1.36:5000"
+```
+
+> Nếu tất cả request đều đến 1 node → `least_conn` chọn node ít connection hơn — khi idle, đây là bình thường. Sẽ thấy phân phối rõ hơn khi có tải.
+
+---
+
+## Giai đoạn 4 — Verify Token Cross-Instance
+
+### Step 15 — Test token được chấp nhận trên cả 2 instance
+
+Đây là bước quan trọng nhất trước khi test: xác nhận token ký trên VM1 hợp lệ trên VM2.
+
+```bash
+# Bước 1: Lấy token (request sẽ đến VM1 hoặc VM2 ngẫu nhiên qua LB)
+TOKEN=$(curl -s -X POST http://192.168.1.35:80/connect/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=password&client_id=angular-spa&username=loadtest_001@test.com&password=TestPass@123&scope=openid profile email roles" \
+  | jq -r .access_token)
+
+echo "Token nhận được: ${TOKEN:0:60}..."
+
+# Bước 2: Gọi trực tiếp vào VM1 (BYPASS LB — port 5000)
+echo "=== Test VM1 (trực tiếp) ==="
+curl -s -o /dev/null -w "HTTP Status: %{http_code}\n" \
+  -H "Authorization: Bearer $TOKEN" \
+  http://192.168.1.35:5000/api/products?pageSize=1
+# Kỳ vọng: HTTP Status: 200
+
+# Bước 3: Gọi trực tiếp vào VM2 (BYPASS LB — port 5000)
+echo "=== Test VM2 (trực tiếp) ==="
+curl -s -o /dev/null -w "HTTP Status: %{http_code}\n" \
+  -H "Authorization: Bearer $TOKEN" \
+  http://192.168.1.36:5000/api/products?pageSize=1
+# Kỳ vọng: HTTP Status: 200
+```
+
+**Kết quả:**
+
+```
+Cả 2 đều 200 → cert đồng bộ đúng → SẴN SÀNG load test
+
+VM1 = 200, VM2 = 401 → cert không khớp → kiểm tra lại:
+  1. ls -la docker/certs/ trên VM2 → file pfx có tồn tại không?
+  2. docker exec api printenv | grep OpenIddict → có CertPath không?
+  3. docker logs api | grep -i cert → có lỗi cert không?
+  4. Nếu cần: copy lại pfx từ VM1 sang VM2 và rebuild
+
+VM1 = 200, VM2 = 404 → endpoint /api/products chưa seed dữ liệu
+  → docker logs api trên VM2 → có dòng "Application started" chưa?
+```
+
+---
+
+## Giai đoạn 5 — Crash Test 2 & So Sánh
+
+### Step 16 — Update Prometheus scrape VM2
+
+Mở [docker/prometheus/prometheus.yml](docker/prometheus/prometheus.yml), bỏ comment đoạn scrape VM2:
+
+```yaml
+  - job_name: 'dotnet-api-vm2'
+    static_configs:
+      - targets: ['192.168.1.36:5000']   # ← đổi thành IP thực của VM2
+    metrics_path: '/metrics'
+```
+
+Reload Prometheus (không cần restart, không mất dữ liệu):
+```bash
+curl -X POST http://192.168.1.35:9090/-/reload
+# Nếu không có gì xuất hiện → thành công (HTTP 200 không có body)
+```
+
+Verify cả 2 target đang UP:
+```
+Mở: http://192.168.1.35:9090 → Status → Targets
+
+Kỳ vọng:
+  ● dotnet-api      State=UP  (api:8080)           ← VM1
+  ● dotnet-api-vm2  State=UP  (192.168.1.36:5000)  ← VM2
+```
+
+Giờ trong Grafana dashboard 10915, dropdown **Instances** sẽ có cả `api:8080` và `192.168.1.36:5000` — bạn có thể mở 2 tab để so sánh load giữa 2 node trong thời gian thực.
+
+---
+
+### Step 17 — Chạy Crash Test lần 2 qua Load Balancer
+
+Mở 4 cửa sổ/tab song song:
+
+```
+Cửa sổ 1 — Terminal: chạy k6
+Cửa sổ 2 — Grafana 2587: tổng quan — p95, error rate qua LB
+Cửa sổ 3 — Grafana 10915 (Instance = api:8080): CPU/GC VM1
+Cửa sổ 4 — Grafana 10915 (Instance = 192.168.1.36:5000): CPU/GC VM2
+```
+
+Chạy crash test — **chỉ thay BASE_URL sang port 80 (Nginx LB)**:
+
+```bash
+k6 run \
+  --out influxdb=http://192.168.1.35:8086/k6 \
+  --env BASE_URL=http://192.168.1.35:80 \
+  k6/crash-test.js
+```
+
+Hoặc qua Docker:
+```bash
+docker run --rm -i \
+  --network host \
+  -v ${PWD}/k6:/scripts \
+  grafana/k6 run \
+    --out influxdb=http://192.168.1.35:8086/k6 \
+    --env BASE_URL=http://192.168.1.35:80 \
+    /scripts/crash-test.js
+```
+
+**Quan sát trong lúc test chạy:**
+
+```
+Bình thường khi có 2 node:
+  ● Grafana 10915 VM1: CPU ~50%, GC bình thường
+  ● Grafana 10915 VM2: CPU ~50%, GC bình thường
+  ● Nginx phân phối đều → cả 2 node cùng chịu tải
+
+Dấu hiệu Nginx đang hoạt động đúng:
+  ● VM1 CPU + VM2 CPU ≈ nhau → least_conn đang cân bằng tốt
+  ● Nếu 1 node GC pause → node kia tạm nhận thêm request → node GC xong → về cân bằng
+
+Dấu hiệu vẫn có vấn đề:
+  ● Cả 2 node CPU 100% → SQL Server là bottleneck (bottleneck chuyển tầng)
+  ● error rate cao ngay từ đầu → kiểm tra lại nginx.conf và token cross-instance
+```
+
+---
+
+### Step 18 — Đọc và so sánh kết quả
+
+**Điền vào bảng so sánh:**
+
+```
+╔════════════════════════════════════════════════════════════════════╗
+║  SO SÁNH CRASH TEST 1 vs CRASH TEST 2                             ║
+╠══════════════════════════════╦═══════════════╦════════════════════╣
+║  Metric                      ║ 1 Instance    ║ 2 Instance (LB)    ║
+╠══════════════════════════════╬═══════════════╬════════════════════╣
+║  Ngưỡng degraded (p95 > 1s)  ║ _____ VU      ║ _____ VU           ║
+║  Ngưỡng collapse (err > 30%) ║ _____ VU      ║ _____ VU           ║
+║  p95 latency tại 300 VU      ║ _____ ms      ║ _____ ms           ║
+║  p95 latency tại 500 VU      ║ _____ ms      ║ _____ ms           ║
+║  Max throughput (req/s)       ║ _____ req/s   ║ _____ req/s        ║
+║  Self-recover sau test        ║ CÓ / KHÔNG   ║ CÓ / KHÔNG        ║
+╚══════════════════════════════╩═══════════════╩════════════════════╝
+```
+
+**Kết quả lý tưởng (so sánh lý thuyết vs thực tế):**
+
+| Metric | Lý thuyết (2x) | Thực tế |
+|---|---|---|
+| Ngưỡng degraded | 2x | ~1.5–1.9x |
+| Max throughput | 2x | ~1.6–1.9x |
+| p95 ở cùng số VU | Giảm 50% | Giảm 30–50% |
+
+> **Tại sao không đạt đúng 2x?** SQL Server vẫn là 1 instance dùng chung cho cả 2 API node. Khi VU tăng cao, SQL Server trở thành bottleneck mới thay vì CPU của API. Gain thực tế = gain của API tầng / (1 + overhead SQL).
+
+**Đọc Grafana để hiểu bottleneck đã chuyển đâu:**
+
+```
+Sau khi scale:
+
+Nếu: CPU VM1 + CPU VM2 đều thấp (<50%) nhưng p95 vẫn cao
+→ SQL Server là bottleneck mới
+→ Trong SSMS: chạy Query 1 để xem wait_type
+→ wait_type = PAGEIOLATCH_SH → thiếu index
+→ wait_type = LCK_M_X → lock contention (cần optimistic concurrency)
+
+Nếu: CPU VM1 + CPU VM2 đều cao (~80–90%) → p95 tương đối OK
+→ Hệ thống đang dùng tài nguyên tốt
+→ Muốn scale thêm → thêm VM3
+
+Nếu: Error rate vẫn cao dù p95 thấp
+→ Có thể SQL connection pool cạn (cả 2 node dùng chung pool)
+→ Kiểm tra: số connection trong SSMS (Query 2)
+→ Fix: thêm "Max Pool Size=300" vào connection string
+```
+
+---
+
+## Checklist toàn bộ quy trình
+
+```
+GIAI ĐOẠN 0 — VMware Setup:
+[ ] VM1 dùng Bridged network → ip addr = 192.168.1.35
+[ ] VM2 đã tạo xong → Bridged → ip addr = 192.168.1.36
+[ ] VM2 đã cài Docker + Docker Compose
+[ ] ping từ VM2 đến VM1 → OK
+[ ] ping từ VM1 đến VM2 → OK
+
+GIAI ĐOẠN 1 — VM1 Setup:
+[ ] create-certs.sh → docker/certs/openiddict.pfx đã tạo
+[ ] docker/.env → OPENIDDICT_CERT_PASSWORD đã tạo
+[ ] docker-compose.monitoring.yml → thêm cert volumes + env cho api
+[ ] docker compose up -d --build → 5 container healthy
+[ ] docker logs api → thấy "Application started", KHÔNG thấy "Access denied"
+[ ] docker exec api printenv | grep OpenIddict → thấy CertPath
+[ ] curl VM1:5000/health → {"status":"Healthy"}
+[ ] Prometheus Targets → dotnet-api = UP
+[ ] Grafana: 2 datasource + 3 dashboard đã import
+
+GIAI ĐOẠN 1 — Crash Test 1:
+[ ] Mở Grafana 2587 + 10915 (instance api:8080)
+[ ] Chạy k6 crash-test.js → BASE_URL=VM1:5000
+[ ] Ghi lại ngưỡng degraded: _____ VU
+[ ] Ghi lại ngưỡng collapse: _____ VU
+[ ] Verify self-recover sau khi VU → 0
+
+GIAI ĐOẠN 2 — VM2 Setup:
+[ ] VM2: source code đã có (git clone hoặc scp)
+[ ] VM2: docker/certs/openiddict.pfx đã copy từ VM1
+[ ] VM2: docker/.env đã tạo với cùng password
+[ ] VM2: connection string trỏ đúng IP VM1 (SQL Server)
+[ ] VM2: docker compose -f docker-compose.node2.yml up -d --build
+[ ] VM2: docker logs api → "Application started", KHÔNG thấy migration errors
+[ ] curl VM2:5000/health → {"status":"Healthy"}
+
+GIAI ĐOẠN 3 — Load Balancer:
+[ ] nginx.conf: IP VM2 đã cập nhật (192.168.1.36:5000)
+[ ] docker compose -f docker-compose.lb.yml up -d nginx-lb
+[ ] curl VM1:80/lb-health → nginx-lb-ok
+[ ] docker logs nginx-lb → thấy request đến cả 2 upstream
+
+GIAI ĐOẠN 4 — Verify Token:
+[ ] Lấy TOKEN qua LB (port 80)
+[ ] curl -H "Authorization: Bearer $TOKEN" VM1:5000/api/products → HTTP 200
+[ ] curl -H "Authorization: Bearer $TOKEN" VM2:5000/api/products → HTTP 200
+[ ] Nếu VM2 = 401 → dừng, fix cert trước khi test
+
+GIAI ĐOẠN 5 — Prometheus + Crash Test 2:
+[ ] prometheus.yml: bỏ comment job dotnet-api-vm2 với IP VM2
+[ ] curl -X POST VM1:9090/-/reload
+[ ] Prometheus Targets: cả 2 target UP (VM1 + VM2)
+[ ] Mở Grafana 2587 + 10915 VM1 + 10915 VM2 (3 tab)
+[ ] Chạy k6 crash-test.js → BASE_URL=VM1:80 (qua LB)
+[ ] Điền bảng so sánh kết quả
+[ ] Ngưỡng degraded tăng ~1.5–2x → scale thành công
+```
+
+---
+
+## Bottleneck tiếp theo sau khi scale API
+
+Sau khi 2 instance API chạy ổn định, SQL Server sẽ là bottleneck mới:
+
+```
+Dấu hiệu SQL Server là bottleneck:
+  ✗ CPU VM1 + VM2 thấp (< 50%) nhưng p95 vẫn cao
+  ✗ Trong SSMS: wait_type = PAGEIOLATCH_SH hoặc LCK_M_X chiếm nhiều
+  ✗ http_req_waiting cao trong k6 (thời gian server xử lý) — CPU .NET thấp
+
+Giải pháp theo thứ tự effort (từ thấp đến cao):
+  1. Thêm index trên các cột hay WHERE/JOIN:
+     UserId, CategoryId, CreatedAt trên bảng Orders/Products
+     → Effort thấp nhất, impact cao nhất
+
+  2. Tăng connection pool trong connection string:
+     Max Pool Size=300;Min Pool Size=10;
+     → Tránh "connection pool exhausted" khi 2 API cùng kết nối
+
+  3. Redis cache cho GET /api/products:
+     → Giảm read load SQL xuống ~80%
+     → Thêm service redis vào docker-compose
+
+  4. Read replica SQL Server:
+     → All reads → read replica
+     → All writes → primary
+     → Cần SQL Server Enterprise hoặc chuyển sang PostgreSQL với streaming replication
+```
+
+---
+
+---
+
+# Phụ lục — Tóm tắt thay đổi code & infrastructure
+
+> Phần này ghi lại **tất cả những gì đã được thêm mới hoặc sửa đổi** trong dự án để phục vụ bài toán Crash Test + Scale Load Balancing, giúp bạn nắm rõ từng file làm gì và liên kết với nhau như thế nào.
+
+---
+
+## Những file đã được tạo mới
+
+### `k6/crash-test.js` — Script tìm điểm chết
+
+**Làm gì:** Tăng Virtual Users từ 50 lên 2000 trong vòng ~10 phút, không có threshold (không dừng sớm khi vượt ngưỡng), sau đó hạ về 0 để quan sát recovery.
+
+**Khác gì load-test.js:**
+
+| | `load-test.js` | `crash-test.js` |
+|---|---|---|
+| Mục tiêu | Đo performance ở tải bình thường | Tìm điểm hệ thống fail |
+| Thresholds | Có (p95 < 3s, error < 5%) | Không có |
+| Max VU | 1000 | 2000 |
+| Timeout request | Mặc định | 20s (để thấy server treo) |
+| Custom metrics | login/product/order duration | `crash_login_ok`, `crash_timeout`, `crash_5xx` |
+| Giai đoạn ramp-down | Có | Có — quan sát hệ thống tự recover không |
+
+**Vì sao timeout 20s thay vì mặc định:** Timeout ngắn (5s) sẽ làm k6 đánh dấu fail ngay và chuyển sang VU tiếp theo — bạn không thấy được hệ thống đang bị treo hay chỉ chậm. Timeout 20s cho phép quan sát server thật sự không trả lời được.
+
+**Custom metrics giải thích:**
+
+```
+crash_login_ok   → Rate (0–100%): giảm dần khi server bị quá tải
+                   100% = khỏe, 0% = chết hoàn toàn
+
+crash_timeout    → Rate (0–100%): tăng khi connection pool cạn, server không accept kết nối mới
+                   Khác crash_5xx: timeout nghĩa là server không trả lời gì
+                   crash_5xx nghĩa là server trả lời nhưng là lỗi
+
+crash_5xx        → Rate (0–100%): tăng khi server crash / OOM / unhandled exception
+crash_login_ms   → Trend (ms): thấy rõ latency leo thang từng bước theo VU
+```
+
+---
+
+### `docker/nginx.conf` — Cấu hình Nginx Load Balancer
+
+**Làm gì:** Định nghĩa upstream pool 2 backend (VM1:5000 và VM2:5000), nhận request vào port 80 rồi phân phối.
+
+**Các quyết định thiết kế:**
+
+```
+least_conn (thay vì round_robin mặc định):
+  → Round-robin chia đều số request
+  → Least_conn chia đều số connection đang mở
+  → Khi VM1 đang xử lý request lâu (GC pause), least_conn sẽ chuyển sang VM2
+  → Round-robin vẫn sẽ gửi tiếp vào VM1 dù nó đang bận
+
+max_fails=3 fail_timeout=30s:
+  → Nếu 1 backend fail 3 lần trong 30s → Nginx tạm loại backend đó ra
+  → Sau 30s → thử lại → nếu OK → đưa vào pool trở lại
+  → Không cần tay can thiệp khi 1 instance bị crash
+
+proxy_next_upstream error timeout http_502 http_503:
+  → Nếu request đến VM1 bị lỗi → Nginx tự retry sang VM2
+  → User không thấy lỗi 502
+
+keepalive 64:
+  → Giữ 64 connection sẵn có đến mỗi backend
+  → Tránh tốn thời gian TCP handshake mỗi request
+
+log_format lb_log → upstream_addr:
+  → Log ghi rõ request đến 192.168.1.35:5000 hay 192.168.1.36:5000
+  → Dùng để verify LB đang phân phối thật sự, không phải chỉ gửi về 1 node
+```
+
+---
+
+### `docker/docker-compose.lb.yml` — Service Nginx LB cho VM1
+
+**Làm gì:** Định nghĩa service `nginx-lb` chạy trên VM1, mount `nginx.conf` vào, expose port 80.
+
+**Tại sao tách file thay vì thêm vào `docker-compose.monitoring.yml`:** Nginx LB chỉ cần thiết sau khi VM2 đã up. Tách file cho phép:
+
+```bash
+# Thêm LB vào stack hiện có mà không rebuild toàn bộ
+docker compose -f docker-compose.monitoring.yml \
+               -f docker-compose.lb.yml up -d nginx-lb
+
+# Gỡ LB ra không ảnh hưởng monitoring stack
+docker compose -f docker-compose.lb.yml down nginx-lb
+```
+
+---
+
+### `docker/docker-compose.node2.yml` — Stack API-only cho VM2
+
+**Làm gì:** Chạy đúng 1 service `api` trên VM2, kết nối vào SQL Server trên VM1, dùng cert file được copy sang.
+
+**Tại sao không chạy monitoring stack trên VM2:**
+- Prometheus/Grafana/InfluxDB đã có trên VM1
+- Prometheus trên VM1 scrape VM2 bằng IP (không cần VM2 chạy Prometheus riêng)
+- Tiết kiệm RAM/CPU cho VM2 — toàn bộ tài nguyên dành cho API
+
+**Điểm khác biệt quan trọng với `docker-compose.monitoring.yml`:**
+
+```yaml
+# docker-compose.node2.yml buộc phải có:
+- OpenIddict__CertPath=/app/certs/openiddict.pfx
+- OpenIddict__CertPassword=${OPENIDDICT_CERT_PASSWORD}
+volumes:
+  - ./certs/openiddict.pfx:/app/certs/openiddict.pfx:ro
+
+# Lý do: nếu thiếu cert → code fallback về Ephemeral key
+#         → key VM2 khác key VM1 → token ký bởi VM1 invalid trên VM2 → 401
+```
+
+---
+
+### `docker/create-certs.sh` — Script tạo cert `.pfx`
+
+**Làm gì:** Chạy 3 lệnh `openssl` để sinh RSA key → tạo self-signed cert → đóng gói thành `.pfx`.
+
+**Tại sao dùng self-signed cert (không phải Let's Encrypt / CA thật):**
+- Cert này **không phải TLS certificate** — không dùng cho HTTPS
+- Chỉ dùng để ký payload bên trong JWT token
+- Client không bao giờ thấy cert này — chỉ có server dùng để sign và verify
+- Self-signed là hoàn toàn hợp lệ và an toàn cho mục đích này
+
+**Tại sao cert 10 năm:** JWT signing key không cần rotate thường xuyên (khác với TLS cert). Rotate key JWT cần: deploy key mới, giữ key cũ còn hiệu lực đến khi tất cả token cũ hết hạn (7 ngày với config hiện tại), rồi mới xóa key cũ. Dùng 10 năm để tránh làm bài tập này trong vòng đời lab.
+
+---
+
+## Những file đã được cập nhật
+
+### `docker/prometheus/prometheus.yml` — Thêm job VM2 và node-exporter (dạng comment)
+
+**Thay đổi:** Thêm 2 khối scrape config dạng comment:
+
+```yaml
+# job dotnet-api-vm2: scrape API trên VM2 — bỏ comment khi VM2 đã up
+# job node-exporter:  scrape metrics hệ thống host — bỏ comment khi thêm node-exporter vào compose
+```
+
+**Tại sao để dạng comment thay vì xóa:** File này dùng cho cả lúc chưa có VM2 (chạy lần đầu) và lúc đã có VM2. Comment giúp bạn biết chính xác chỗ nào cần bỏ comment mà không cần nhớ cú pháp YAML.
+
+**Cách áp dụng thay đổi prometheus.yml mà không restart container:**
+```bash
+curl -X POST http://192.168.1.35:9090/-/reload
+# Prometheus reload config trong vòng 2–3 giây, không mất dữ liệu đã scrape
+```
+
+### `answer.md` — Thêm Phần 7 + Phụ lục + Mục lục
+
+**Thay đổi:**
+- Mục lục: thêm Phần 7 (12 section) + Phụ lục
+- Nội dung: Phần 7 hướng dẫn crash test → tìm ngưỡng → scale → verify
+- Phụ lục (phần này): giải thích từng file thay đổi
+
+---
+
+## Luồng triển khai toàn bộ
+
+```
+GIAI ĐOẠN 0 — VMware Setup:
+  VM1: Bridged network → 192.168.1.35
+  VM2: Tạo mới → Bridged → 192.168.1.36 (IP tĩnh)
+  VM2: Cài Docker Engine + Docker Compose
+  Verify: ping VM1↔VM2 đều thành công
+         │
+         ▼
+GIAI ĐOẠN 1a — VM1 Setup (cert + stack):
+  create-certs.sh → docker/certs/openiddict.pfx          [VM1]
+  Cập nhật docker-compose.monitoring.yml (cert volumes)  [VM1]
+  docker compose up -d --build                           [VM1]
+  Verify: 5 container healthy, login API OK
+         │
+         ▼
+GIAI ĐOẠN 1b — Crash Test 1 (tìm ngưỡng):
+  k6 crash-test.js → BASE_URL=http://192.168.1.35:5000  [từ máy test]
+  Quan sát Grafana 2587 + 10915 song song
+  Ghi lại: VU degraded = _____, VU collapse = _____
+         │
+         ▼
+GIAI ĐOẠN 2 — Setup VM2:
+  scp source code → VM2                                  [VM1→VM2]
+  scp openiddict.pfx → VM2/docker/certs/                 [VM1→VM2]
+  Tạo .env trên VM2
+  docker compose -f docker-compose.node2.yml up -d --build  [VM2]
+  Verify: curl VM2:5000/health → {"status":"Healthy"}
+         │
+         ▼
+GIAI ĐOẠN 3 — Load Balancer:
+  Sửa nginx.conf: điền IP VM2 (192.168.1.36:5000)        [VM1]
+  docker compose -f docker-compose.lb.yml up -d nginx-lb  [VM1]
+  Verify: curl VM1:80/lb-health → nginx-lb-ok
+  Verify: docker logs nginx-lb → thấy 2 upstream xen kẽ
+         │
+         ▼
+GIAI ĐOẠN 4 — Verify Token Cross-Instance:
+  Login qua LB (port 80) → lấy TOKEN
+  curl -H "Bearer $TOKEN" VM1:5000/api/products → 200    [bypass LB]
+  curl -H "Bearer $TOKEN" VM2:5000/api/products → 200    [bypass LB]
+  Nếu VM2 = 401 → DỪNG, fix cert trước
+         │
+         ▼
+GIAI ĐOẠN 5a — Update Prometheus:
+  Bỏ comment job dotnet-api-vm2 trong prometheus.yml
+  curl -X POST http://192.168.1.35:9090/-/reload
+  Verify: Status → Targets → 2 target UP (VM1 + VM2)
+         │
+         ▼
+GIAI ĐOẠN 5b — Crash Test 2 (verify scale):
+  k6 crash-test.js → BASE_URL=http://192.168.1.35:80    [qua LB]
+  Mở Grafana 2587 + 10915(VM1) + 10915(VM2) — 3 tab song song
+  Điền bảng so sánh: ngưỡng tăng ~1.5–2x → thành công
+```
+
+**Kết quả kỳ vọng sau khi scale:**
+
+| | Trước (1 instance) | Sau (2 instance + LB) |
+|---|---|---|
+| Ngưỡng degraded | ~300–600 VU | ~600–1000 VU (1.5–2x) |
+| Ngưỡng collapse | ~600–1200 VU | ~1200–2000 VU (1.5–2x) |
+| p95 ở cùng số VU | Baseline | Giảm 30–50% |
+| Max throughput | X req/s | ~1.6–1.9X req/s |
+| Token cross-instance | N/A | Hợp lệ (cùng cert file) |
+| Recovery sau hạ tải | Phụ thuộc | Tốt hơn (LB phân tán GC pause) |
+
+> Gain thực tế là 1.6–1.9x (không phải 2x lý tưởng) vì SQL Server vẫn là 1 instance dùng chung — đây là bottleneck tầng tiếp theo sau khi tầng API đã được scale.

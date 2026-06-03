@@ -1,17 +1,29 @@
 global:
-  scrape_interval: 5s        # Thu thập metrics mỗi 5 giây
+  scrape_interval: 5s
   evaluation_interval: 5s
 
 scrape_configs:
 
-  # .NET API — expose qua /metrics (prometheus-net.AspNetCore)
-  # Dùng tên service Docker (api:8080) vì API đã chạy trong cùng Docker network
+  # ── API trên VM1 (qua Docker service name) ────────────────────────────────────
   - job_name: 'dotnet-api'
     static_configs:
       - targets: ['api:8080']
     metrics_path: '/metrics'
 
-  # cAdvisor — CPU/RAM/Network của từng Docker container
+  # ── API trên VM2 — bỏ comment sau khi VM2 đã up ──────────────────────────────
+  # Thay 192.168.1.36 bằng IP thực của VM2
+  #
+  # - job_name: 'dotnet-api-vm2'
+  #   static_configs:
+  #     - targets: ['192.168.1.36:5000']
+  #   metrics_path: '/metrics'
+
+  # ── cAdvisor — CPU/RAM của Docker containers ──────────────────────────────────
   - job_name: 'cadvisor'
     static_configs:
       - targets: ['cadvisor:8080']
+
+  # ── node-exporter — metrics hệ thống host (CPU, RAM, Disk — cho dashboard 893) ──
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']

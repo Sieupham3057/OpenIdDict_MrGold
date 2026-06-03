@@ -33,6 +33,7 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'              # Cho phép curl -X POST /-/reload
     depends_on:
       api:
         condition: service_healthy           # Đợi API healthy trước khi scrape
@@ -88,10 +89,29 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # ── node-exporter: Metrics hệ thống host (CPU, RAM, Disk, Network của OS) ──────
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+
   # ── cAdvisor: Thu thập CPU/RAM/Network của Docker containers ──────────────────
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:latest
     container_name: cadvisor
+    privileged: true                         # Bắt buộc — đọc /proc kernel-level
+    devices:
+      - /dev/kmsg                            # Đọc kernel ring buffer (OOM, throttle)
     ports:
       - "8080:8080"
     volumes:

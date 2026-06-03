@@ -1,0 +1,52 @@
+version: '3.8'
+
+# ─── Node 2 — Chạy trên VM2 ───────────────────────────────────────────────────
+#
+# Chỉ chạy API — monitoring stack vẫn ở VM1
+# Prometheus trên VM1 sẽ scrape API này qua IP của VM2
+#
+# ── Chuẩn bị trên VM2 trước khi chạy ─────────────────────────────────────────
+#   1. Clone repo (hoặc scp toàn bộ source):
+#      git clone <repo-url> ~/project && cd ~/project
+#
+#   2. Copy cert từ VM1 (PHẢI cùng file với VM1 để token hợp lệ trên cả 2):
+#      mkdir -p docker/certs
+#      scp user@192.168.1.35:~/project/docker/certs/openiddict.pfx docker/certs/
+#
+#   3. Tạo file docker/.env:
+#      echo "OPENIDDICT_CERT_PASSWORD=OpenIddict@2024" > docker/.env
+#
+#   4. Chạy:
+#      cd docker
+#      docker compose -f docker-compose.node2.yml up -d --build
+
+services:
+
+  api:
+    build:
+      context: ..
+      dockerfile: AuthDemo.Api/Dockerfile
+    container_name: api
+    ports:
+      - "5000:8080"       # Prometheus trên VM1 scrape VM2:5000/metrics
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      # ⚠️ SQL Server vẫn chạy trên VM1 — cả 2 API share cùng 1 database
+      - ConnectionStrings__DefaultConnection=Server=192.168.1.35,1433;Database=AuthDemoDB;User Id=sa;Password=YourStrong@Passw0rd;TrustServerCertificate=True;
+      # ⚠️ PHẢI dùng cùng cert với VM1 — đây là lý do ephemeral key không thể dùng multi-instance
+      # Token được ký trên VM1 bằng key từ file .pfx → validate trên VM2 cũng dùng cùng file → hợp lệ
+      - OpenIddict__CertPath=/app/certs/openiddict.pfx
+      - OpenIddict__CertPassword=${OPENIDDICT_CERT_PASSWORD}
+    volumes:
+      - ./certs/openiddict.pfx:/app/certs/openiddict.pfx:ro
+      - api-logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+
+volumes:
+  api-logs:
