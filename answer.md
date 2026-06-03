@@ -88,16 +88,17 @@
   - [Step 9 — Copy source code + cert sang VM2](#step-9--copy-source-code--cert-sang-vm2)
   - [Step 10 — Khởi động API trên VM2](#step-10--khởi-động-api-trên-vm2)
   - [Step 11 — Verify VM2 API healthy](#step-11--verify-vm2-api-healthy)
-- [Giai đoạn 3 — Setup Nginx Load Balancer trên VM1](#giai-đoạn-3--setup-nginx-load-balancer-trên-vm1)
-  - [Step 12 — Cấu hình nginx.conf với IP thực](#step-12--cấu-hình-nginxconf-với-ip-thực)
-  - [Step 13 — Khởi động Nginx LB](#step-13--khởi-động-nginx-lb)
-  - [Step 14 — Verify LB phân phối đến cả 2 node](#step-14--verify-lb-phân-phối-đến-cả-2-node)
+- [Giai đoạn 3 — Setup VM-LB (dedicated Nginx Load Balancer)](#giai-đoạn-3--setup-vm-lb-dedicated-nginx-load-balancer)
+  - [Step 12 — Tạo VM-LB + cài Docker + set IP tĩnh](#step-12--tạo-vm-lb--cài-docker--set-ip-tĩnh)
+  - [Step 13 — Cấu hình nginx.conf với IP thực](#step-13--cấu-hình-nginxconf-với-ip-thực-của-vm1-và-vm2)
+  - [Step 14 — Khởi động Nginx LB trên VM-LB](#step-14--khởi-động-nginx-lb-trên-vm-lb)
+  - [Step 15 — Verify LB phân phối đến cả 2 node](#step-15--verify-lb-phân-phối-đến-cả-2-node)
 - [Giai đoạn 4 — Verify Token Cross-Instance](#giai-đoạn-4--verify-token-cross-instance)
-  - [Step 15 — Test token được chấp nhận trên cả 2 instance](#step-15--test-token-được-chấp-nhận-trên-cả-2-instance)
+  - [Step 16 — Test token được chấp nhận trên cả 2 instance](#step-16--test-token-được-chấp-nhận-trên-cả-2-instance)
 - [Giai đoạn 5 — Crash Test 2 & So Sánh](#giai-đoạn-5--crash-test-2--so-sánh)
-  - [Step 16 — Update Prometheus scrape VM2](#step-16--update-prometheus-scrape-vm2)
-  - [Step 17 — Chạy Crash Test lần 2 qua Load Balancer](#step-17--chạy-crash-test-lần-2-qua-load-balancer)
-  - [Step 18 — Đọc và so sánh kết quả](#step-18--đọc-và-so-sánh-kết-quả)
+  - [Step 17 — Update Prometheus scrape VM2](#step-17--update-prometheus-scrape-vm2)
+  - [Step 18 — Chạy Crash Test lần 2 qua Load Balancer (VM-LB)](#step-18--chạy-crash-test-lần-2-qua-load-balancer-vm-lb)
+  - [Step 19 — Đọc và so sánh kết quả](#step-19--đọc-và-so-sánh-kết-quả)
 - [Bottleneck tiếp theo sau khi scale API](#bottleneck-tiếp-theo-sau-khi-scale-api)
 
 **[Phụ lục — Tóm tắt thay đổi code & infrastructure](#phụ-lục--tóm-tắt-thay-đổi-code--infrastructure)**
@@ -2894,9 +2895,9 @@ API có còn sống không              │ up{job="dotnet-api"} (1=UP, 0=DOWN)
 
 # PHẦN 7 — Crash Test & Scale Load Balancing Thực Tế
 
-> **Mục tiêu:** Tìm ngưỡng chết của 1 instance trên VM1 → deploy thêm VM2 trong VMware → setup Nginx LB → chạy lại cùng bài test → so sánh kết quả.
+> **Mục tiêu:** Tìm ngưỡng chết của 1 instance trên VM1 → deploy thêm VM2 → dựng VM-LB chạy Nginx reverse proxy riêng biệt → chạy lại cùng bài test → so sánh kết quả.
 >
-> **Kịch bản:** Máy bạn chạy VMware Workstation. Tất cả VM trong dải `192.168.1.*`. VM1 đã có sẵn, VM2 sẽ tạo mới.
+> **Kịch bản:** Máy bạn chạy VMware Workstation. Tất cả VM trong dải `192.168.1.*`. VM1 đã có sẵn, VM2 và VM-LB sẽ tạo mới. 3 VM mô phỏng đúng kiến trúc production: LB tách biệt hoàn toàn khỏi app node.
 
 ---
 
@@ -2922,36 +2923,42 @@ GIAI ĐOẠN 1 — 1 máy:
   └─────────────────────────────────┘
 
 
-GIAI ĐOẠN 2 — 2 máy + Load Balancer:
+GIAI ĐOẠN 2 — 3 máy + dedicated Load Balancer (production-like):
 
   k6 (laptop/VM)
        │
        ▼ port 80
-  ┌───────────────────────────────────────────────────────┐
-  │  VM1 — 192.168.1.35                                   │
-  │  ┌────────────────────────────────────────────────┐   │
-  │  │  nginx-lb (port 80) ← entry point duy nhất     │   │
-  │  │       │                    │                   │   │
-  │  │  api:5000 (VM1)    192.168.1.36:5000 (VM2)     │   │
-  │  │  + monitoring stack                            │   │
-  │  └────────────────────────────────────────────────┘   │
-  │  SQL Server ← cả 2 instance cùng kết nối vào đây      │
-  └───────────────────────────────────────────────────────┘
-
-  ┌─────────────────────────┐
-  │  VM2 — 192.168.1.36     │
-  │  ├─ Docker: api :5000   │
-  │  └─ (không monitoring)  │
-  └─────────────────────────┘
+  ┌─────────────────────────────┐
+  │  VM-LB — 192.168.1.34       │
+  │  └─ nginx (reverse proxy)   │  ← entry point duy nhất
+  │       LB + health check     │    tách biệt hoàn toàn
+  └──────┬──────────────────────┘
+         │ upstream (round-robin / least_conn)
+    ┌────┴────────────────────┐
+    ▼                         ▼
+  ┌─────────────────────┐   ┌─────────────────────┐
+  │ VM1 — 192.168.1.35  │   │ VM2 — 192.168.1.36  │
+  │ api        :5000    │   │ api        :5000     │
+  │ prometheus :9090    │   │ (không monitoring)   │
+  │ grafana    :3000    │   └─────────────────────┘
+  │ influxdb   :8086    │
+  │ cadvisor   :8080    │
+  └─────────────────────┘
+         │
+         ▼
+  SQL Server (Windows host) ← cả 2 instance cùng kết nối
 ```
 
 **IP Plan (thay theo mạng thực của bạn):**
 
 | Máy | IP | Role |
 |---|---|---|
-| VM1 | `192.168.1.35` | API + Monitoring + Nginx LB + SQL Server |
-| VM2 | `192.168.1.36` | API instance thứ 2 (không có monitoring) |
+| VM-LB | `192.168.1.34` | Nginx reverse proxy / Load Balancer (dedicated) |
+| VM1 | `192.168.1.35` | API node 1 + Monitoring stack + SQL Server |
+| VM2 | `192.168.1.36` | API node 2 (lean — không monitoring) |
 | Laptop/máy test | Bất kỳ trong dải | Chạy k6 |
+
+> **Tại sao VM-LB tách riêng?** Trong production, Nginx LB đứng trước tất cả app server. Nếu LB chạy cùng app node (VM1), khi VM1 quá tải → LB cũng bị ảnh hưởng → điểm vào bị hỏng. Tách riêng: VM-LB chỉ làm routing, rất nhẹ (512 MB RAM đủ dùng).
 
 **Files đã có trong repo:**
 
@@ -2959,7 +2966,7 @@ GIAI ĐOẠN 2 — 2 máy + Load Balancer:
 |---|---|
 | [k6/crash-test.js](k6/crash-test.js) | Script crash test — tăng VU đến 2000 |
 | [docker/nginx.conf](docker/nginx.conf) | Cấu hình Nginx LB |
-| [docker/docker-compose.lb.yml](docker/docker-compose.lb.yml) | Service nginx-lb cho VM1 |
+| [docker/docker-compose.lb.yml](docker/docker-compose.lb.yml) | Service nginx-lb chạy trên VM-LB |
 | [docker/docker-compose.node2.yml](docker/docker-compose.node2.yml) | Stack API-only cho VM2 |
 | [docker/create-certs.sh](docker/create-certs.sh) | Script tạo cert .pfx dùng chung |
 | [docker/prometheus/prometheus.yml](docker/prometheus/prometheus.yml) | Đã có comment để bật scrape VM2 |
@@ -2995,15 +3002,17 @@ ip addr show | grep "inet 192"
 
 ### Specs khuyên dùng cho từng VM
 
-| | VM1 | VM2 |
-|---|---|---|
-| OS | Ubuntu Server 22.04 LTS | Ubuntu Server 22.04 LTS |
-| CPU | 2–4 cores | 2–4 cores |
-| RAM | 8–12 GB (SQL Server cần ~4–6 GB) | 4–6 GB |
-| Disk | 40–80 GB | 20–40 GB |
-| Network | Bridged | Bridged |
+| | VM-LB | VM1 | VM2 |
+|---|---|---|---|
+| OS | Ubuntu Server 22.04 LTS | Ubuntu Server 22.04 LTS | Ubuntu Server 22.04 LTS |
+| CPU | 1 core | 2–4 cores | 2–4 cores |
+| RAM | 512 MB – 1 GB | 8–12 GB (SQL Server cần ~4–6 GB) | 4–6 GB |
+| Disk | 10–15 GB | 40–80 GB | 20–40 GB |
+| Network | Bridged | Bridged | Bridged |
 
-> **Tip VMware:** Snapshot VM1 trước khi bắt đầu — nếu có lỗi bạn có thể rollback nhanh mà không cần cài lại.
+> VM-LB rất nhẹ — chỉ chạy Nginx, không cần Docker image lớn, 512 MB RAM là đủ dùng ổn định.
+
+> **Tip VMware:** Snapshot từng VM trước khi bắt đầu — nếu có lỗi bạn có thể rollback nhanh mà không cần cài lại.
 
 ---
 
@@ -3551,66 +3560,158 @@ curl -s -X POST http://192.168.1.36:5000/connect/token \
 
 ---
 
-## Giai đoạn 3 — Setup Nginx Load Balancer trên VM1
+## Giai đoạn 3 — Setup VM-LB (dedicated Nginx Load Balancer)
 
-### Step 12 — Cấu hình nginx.conf với IP thực
+> Tất cả lệnh trong giai đoạn này chạy trên **VM-LB**, trừ khi ghi chú khác.
 
-Mở [docker/nginx.conf](docker/nginx.conf), sửa IP VM2:
+### Step 12 — Tạo VM-LB + cài Docker + set IP tĩnh
+
+**12a. Tạo VM mới trong VMware Workstation:**
+
+```
+VMware Workstation → File → New Virtual Machine
+  → Typical (Recommended) → Next
+  → Installer disc image file (iso) → chọn file Ubuntu 22.04 Server .iso
+  → Next → đặt tên VM: "OpenIdDict-LB"
+  → Disk size: 15 GB → Store as single file
+  → Customize Hardware:
+      Memory: 512 MB (hoặc 1024 MB nếu muốn thoải mái)
+      Processors: 1 core
+      Network Adapter: Bridged (Replicate physical connection)
+  → Finish
+```
+
+**12b. Cài Ubuntu Server 22.04** (giống VM2 — xem Step 7b để tham khảo):
+
+```
+Khi cài đặt:
+  - Install OpenSSH server: ✓ Bật
+  - Username: ví dụ "lb" / password tùy chọn
+  - Chờ cài xong → Reboot
+```
+
+**12c. Set IP tĩnh 192.168.1.34 cho VM-LB:**
+
+```bash
+sudo nano /etc/netplan/00-installer-config.yaml
+```
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    ens33:                          # Kiểm tra tên interface: ip link show
+      dhcp4: no
+      addresses:
+        - 192.168.1.34/24           # IP tĩnh VM-LB
+      gateway4: 192.168.1.1
+      nameservers:
+        addresses: [8.8.8.8, 8.8.4.4]
+```
+
+```bash
+sudo netplan apply
+
+# Verify IP
+ip addr show | grep "inet 192"
+# inet 192.168.1.34/24 ← đúng
+
+# Test ping đến VM1 và VM2
+ping 192.168.1.35 -c 3  # VM1 phải reply
+ping 192.168.1.36 -c 3  # VM2 phải reply
+```
+
+**12d. Cài Docker trên VM-LB:**
+
+```bash
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker $USER
+exit
+# → SSH lại vào VM-LB
+
+docker compose version
+# Docker Compose version 2.x.x
+```
+
+**12e. Copy nginx.conf + docker-compose.lb.yml từ VM1 sang VM-LB:**
+
+```bash
+# Chạy trên VM1
+scp docker/nginx.conf lb@192.168.1.34:~/nginx.conf
+scp docker/docker-compose.lb.yml lb@192.168.1.34:~/docker-compose.lb.yml
+
+# Verify trên VM-LB
+ssh lb@192.168.1.34 "ls -la ~/"
+# nginx.conf  docker-compose.lb.yml
+```
+
+---
+
+### Step 13 — Cấu hình nginx.conf với IP thực của VM1 và VM2
+
+```bash
+# Trên VM-LB
+nano ~/nginx.conf
+```
+
+Sửa upstream block — điền IP VM1 và VM2:
 
 ```nginx
 upstream api_backend {
-    least_conn;                                         # Chia đều connection (không phải request)
-    server 192.168.1.35:5000 max_fails=3 fail_timeout=30s;  # VM1 — API instance 1
-    server 192.168.1.36:5000 max_fails=3 fail_timeout=30s;  # VM2 — đổi IP này
+    least_conn;
+    server 192.168.1.35:5000 max_fails=3 fail_timeout=30s;  # VM1 — API node 1
+    server 192.168.1.36:5000 max_fails=3 fail_timeout=30s;  # VM2 — API node 2
     keepalive 64;
 }
 ```
 
-> `least_conn` tốt hơn `round_robin` mặc định: khi VM1 đang xử lý request lâu (GC pause), Nginx sẽ chuyển request sang VM2 thay vì tiếp tục gửi vào VM1 đang bận.
+> `least_conn` tốt hơn `round_robin` mặc định: khi VM1 đang GC pause (xử lý chậm), Nginx sẽ chuyển request sang VM2 thay vì tiếp tục gửi vào VM1 đang bận.
 
 ---
 
-### Step 13 — Khởi động Nginx LB
+### Step 14 — Khởi động Nginx LB trên VM-LB
 
 ```bash
-# Trên VM1
-cd ~/projects/OpenIdDict_MrGold/docker
+# Trên VM-LB
+cd ~
 
-docker compose -f docker-compose.monitoring.yml \
-               -f docker-compose.lb.yml up -d nginx-lb
+docker compose -f docker-compose.lb.yml up -d nginx-lb
 ```
 
 Kiểm tra:
 ```bash
 docker ps | grep nginx-lb
 # nginx-lb   Up X seconds (healthy)
+
+docker logs nginx-lb --tail 10
+# Không có lỗi → nginx started successfully
 ```
 
 ---
 
-### Step 14 — Verify LB phân phối đến cả 2 node
+### Step 15 — Verify LB phân phối đến cả 2 node
 
-**14a. Health check qua LB:**
+**15a. Health check qua LB (từ laptop hoặc VM1):**
 
 ```bash
-curl http://192.168.1.35/lb-health
+curl http://192.168.1.34/lb-health
 # nginx-lb-ok
 ```
 
-**14b. Gọi nhiều lần, xem log Nginx để thấy request đến cả 2 node:**
+**15b. Gọi nhiều lần qua LB, xem log Nginx thấy request đến cả 2 node:**
 
 ```bash
-# Gọi 10 lần qua LB
+# Chạy từ laptop hoặc VM1 — gọi 10 lần qua VM-LB
 for i in {1..10}; do
-  curl -s http://192.168.1.35/health
+  curl -s http://192.168.1.34/health
   echo ""
 done
 
-# Xem Nginx access log
+# Xem log trên VM-LB
 docker logs nginx-lb --tail 20
 ```
 
-Kết quả log mong đợi (thấy 2 upstream IP xen kẽ):
+Kết quả log mong đợi (2 upstream xen kẽ):
 ```
 192.168.1.100 - "GET /health" 200 - 0.013s "upstream: 192.168.1.35:5000"
 192.168.1.100 - "GET /health" 200 - 0.015s "upstream: 192.168.1.36:5000"
@@ -3618,19 +3719,19 @@ Kết quả log mong đợi (thấy 2 upstream IP xen kẽ):
 192.168.1.100 - "GET /health" 200 - 0.014s "upstream: 192.168.1.36:5000"
 ```
 
-> Nếu tất cả request đều đến 1 node → `least_conn` chọn node ít connection hơn — khi idle, đây là bình thường. Sẽ thấy phân phối rõ hơn khi có tải.
+> Nếu tất cả request đều đến 1 node → `least_conn` chọn node ít connection hơn — khi idle là bình thường. Phân phối rõ hơn khi có tải.
 
 ---
 
 ## Giai đoạn 4 — Verify Token Cross-Instance
 
-### Step 15 — Test token được chấp nhận trên cả 2 instance
+### Step 16 — Test token được chấp nhận trên cả 2 instance
 
 Đây là bước quan trọng nhất trước khi test: xác nhận token ký trên VM1 hợp lệ trên VM2.
 
 ```bash
-# Bước 1: Lấy token (request sẽ đến VM1 hoặc VM2 ngẫu nhiên qua LB)
-TOKEN=$(curl -s -X POST http://192.168.1.35:80/connect/token \
+# Bước 1: Lấy token qua VM-LB (entry point duy nhất — port 80)
+TOKEN=$(curl -s -X POST http://192.168.1.34/connect/token \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "grant_type=password&client_id=angular-spa&username=loadtest_001@test.com&password=TestPass@123&scope=openid profile email roles" \
   | jq -r .access_token)
@@ -3671,9 +3772,9 @@ VM1 = 200, VM2 = 404 → endpoint /api/products chưa seed dữ liệu
 
 ## Giai đoạn 5 — Crash Test 2 & So Sánh
 
-### Step 16 — Update Prometheus scrape VM2
+### Step 17 — Update Prometheus scrape VM2
 
-Mở [docker/prometheus/prometheus.yml](docker/prometheus/prometheus.yml), bỏ comment đoạn scrape VM2:
+Mở [docker/prometheus/prometheus.yml](docker/prometheus/prometheus.yml) trên **VM1**, bỏ comment đoạn scrape VM2:
 
 ```yaml
   - job_name: 'dotnet-api-vm2'
@@ -3684,6 +3785,7 @@ Mở [docker/prometheus/prometheus.yml](docker/prometheus/prometheus.yml), bỏ 
 
 Reload Prometheus (không cần restart, không mất dữ liệu):
 ```bash
+# Chạy trên VM1
 curl -X POST http://192.168.1.35:9090/-/reload
 # Nếu không có gì xuất hiện → thành công (HTTP 200 không có body)
 ```
@@ -3701,7 +3803,7 @@ Giờ trong Grafana dashboard 10915, dropdown **Instances** sẽ có cả `api:8
 
 ---
 
-### Step 17 — Chạy Crash Test lần 2 qua Load Balancer
+### Step 18 — Chạy Crash Test lần 2 qua Load Balancer (VM-LB)
 
 Mở 4 cửa sổ/tab song song:
 
@@ -3712,12 +3814,12 @@ Cửa sổ 3 — Grafana 10915 (Instance = api:8080): CPU/GC VM1
 Cửa sổ 4 — Grafana 10915 (Instance = 192.168.1.36:5000): CPU/GC VM2
 ```
 
-Chạy crash test — **chỉ thay BASE_URL sang port 80 (Nginx LB)**:
+Chạy crash test — **BASE_URL trỏ vào VM-LB (192.168.1.34)**:
 
 ```bash
 k6 run \
   --out influxdb=http://192.168.1.35:8086/k6 \
-  --env BASE_URL=http://192.168.1.35:80 \
+  --env BASE_URL=http://192.168.1.34 \
   k6/crash-test.js
 ```
 
@@ -3728,7 +3830,7 @@ docker run --rm -i \
   -v ${PWD}/k6:/scripts \
   grafana/k6 run \
     --out influxdb=http://192.168.1.35:8086/k6 \
-    --env BASE_URL=http://192.168.1.35:80 \
+    --env BASE_URL=http://192.168.1.34 \
     /scripts/crash-test.js
 ```
 
@@ -3751,7 +3853,7 @@ Dấu hiệu vẫn có vấn đề:
 
 ---
 
-### Step 18 — Đọc và so sánh kết quả
+### Step 19 — Đọc và so sánh kết quả
 
 **Điền vào bảng so sánh:**
 
@@ -3806,12 +3908,11 @@ Nếu: Error rate vẫn cao dù p95 thấp
 ## Checklist toàn bộ quy trình
 
 ```
-GIAI ĐOẠN 0 — VMware Setup:
-[ ] VM1 dùng Bridged network → ip addr = 192.168.1.35
-[ ] VM2 đã tạo xong → Bridged → ip addr = 192.168.1.36
-[ ] VM2 đã cài Docker + Docker Compose
-[ ] ping từ VM2 đến VM1 → OK
-[ ] ping từ VM1 đến VM2 → OK
+GIAI ĐOẠN 0 — VMware Setup (3 VM):
+[ ] VM1  → Bridged network → ip addr = 192.168.1.35
+[ ] VM2  → tạo mới → Bridged → ip addr = 192.168.1.36 → cài Docker
+[ ] VM-LB → tạo mới → Bridged → ip addr = 192.168.1.34 → cài Docker
+[ ] ping VM1 ↔ VM2 ↔ VM-LB đều OK (6 chiều)
 
 GIAI ĐOẠN 1 — VM1 Setup:
 [ ] create-certs.sh → docker/certs/openiddict.pfx đã tạo
@@ -3826,38 +3927,40 @@ GIAI ĐOẠN 1 — VM1 Setup:
 
 GIAI ĐOẠN 1 — Crash Test 1:
 [ ] Mở Grafana 2587 + 10915 (instance api:8080)
-[ ] Chạy k6 crash-test.js → BASE_URL=VM1:5000
+[ ] Chạy k6 crash-test.js → BASE_URL=http://192.168.1.35:5000
 [ ] Ghi lại ngưỡng degraded: _____ VU
 [ ] Ghi lại ngưỡng collapse: _____ VU
 [ ] Verify self-recover sau khi VU → 0
 
 GIAI ĐOẠN 2 — VM2 Setup:
-[ ] VM2: source code đã có (git clone hoặc scp)
+[ ] VM2: source code đã có (git clone hoặc scp từ VM1)
 [ ] VM2: docker/certs/openiddict.pfx đã copy từ VM1
 [ ] VM2: docker/.env đã tạo với cùng password
 [ ] VM2: connection string trỏ đúng IP VM1 (SQL Server)
 [ ] VM2: docker compose -f docker-compose.node2.yml up -d --build
 [ ] VM2: docker logs api → "Application started", KHÔNG thấy migration errors
-[ ] curl VM2:5000/health → {"status":"Healthy"}
+[ ] curl 192.168.1.36:5000/health → {"status":"Healthy"}
 
-GIAI ĐOẠN 3 — Load Balancer:
-[ ] nginx.conf: IP VM2 đã cập nhật (192.168.1.36:5000)
-[ ] docker compose -f docker-compose.lb.yml up -d nginx-lb
-[ ] curl VM1:80/lb-health → nginx-lb-ok
-[ ] docker logs nginx-lb → thấy request đến cả 2 upstream
+GIAI ĐOẠN 3 — VM-LB Setup (dedicated nginx):
+[ ] VM-LB: tạo xong, IP tĩnh 192.168.1.34, Docker đã cài
+[ ] VM-LB: nginx.conf đã copy từ VM1 + sửa upstream IP (VM1:5000, VM2:5000)
+[ ] VM-LB: docker-compose.lb.yml đã copy từ VM1
+[ ] VM-LB: docker compose -f docker-compose.lb.yml up -d nginx-lb
+[ ] curl 192.168.1.34/lb-health → nginx-lb-ok
+[ ] docker logs nginx-lb (trên VM-LB) → thấy request đến cả 2 upstream
 
-GIAI ĐOẠN 4 — Verify Token:
-[ ] Lấy TOKEN qua LB (port 80)
-[ ] curl -H "Authorization: Bearer $TOKEN" VM1:5000/api/products → HTTP 200
-[ ] curl -H "Authorization: Bearer $TOKEN" VM2:5000/api/products → HTTP 200
+GIAI ĐOẠN 4 — Verify Token Cross-Instance:
+[ ] Lấy TOKEN qua VM-LB (http://192.168.1.34/connect/token)
+[ ] curl -H "Authorization: Bearer $TOKEN" 192.168.1.35:5000/api/products → HTTP 200
+[ ] curl -H "Authorization: Bearer $TOKEN" 192.168.1.36:5000/api/products → HTTP 200
 [ ] Nếu VM2 = 401 → dừng, fix cert trước khi test
 
 GIAI ĐOẠN 5 — Prometheus + Crash Test 2:
-[ ] prometheus.yml: bỏ comment job dotnet-api-vm2 với IP VM2
-[ ] curl -X POST VM1:9090/-/reload
+[ ] prometheus.yml (trên VM1): bỏ comment job dotnet-api-vm2 với IP VM2
+[ ] curl -X POST http://192.168.1.35:9090/-/reload
 [ ] Prometheus Targets: cả 2 target UP (VM1 + VM2)
 [ ] Mở Grafana 2587 + 10915 VM1 + 10915 VM2 (3 tab)
-[ ] Chạy k6 crash-test.js → BASE_URL=VM1:80 (qua LB)
+[ ] Chạy k6 crash-test.js → BASE_URL=http://192.168.1.34 (qua VM-LB)
 [ ] Điền bảng so sánh kết quả
 [ ] Ngưỡng degraded tăng ~1.5–2x → scale thành công
 ```
@@ -3971,19 +4074,18 @@ log_format lb_log → upstream_addr:
 
 ---
 
-### `docker/docker-compose.lb.yml` — Service Nginx LB cho VM1
+### `docker/docker-compose.lb.yml` — Service Nginx LB cho VM-LB
 
-**Làm gì:** Định nghĩa service `nginx-lb` chạy trên VM1, mount `nginx.conf` vào, expose port 80.
+**Làm gì:** Định nghĩa service `nginx-lb` chạy trên **VM-LB** (máy riêng biệt), mount `nginx.conf` vào, expose port 80. File này được copy sang VM-LB và chạy độc lập ở đó — không liên quan đến stack trên VM1.
 
-**Tại sao tách file thay vì thêm vào `docker-compose.monitoring.yml`:** Nginx LB chỉ cần thiết sau khi VM2 đã up. Tách file cho phép:
+**Tại sao tách file và chạy trên VM riêng:** Trong production, LB đứng trước app server. Nếu LB chạy cùng app node, khi app node quá tải → LB cũng bị ảnh hưởng. Tách ra VM-LB riêng đảm bảo entry point luôn ổn định dù VM1/VM2 có vấn đề:
 
 ```bash
-# Thêm LB vào stack hiện có mà không rebuild toàn bộ
-docker compose -f docker-compose.monitoring.yml \
-               -f docker-compose.lb.yml up -d nginx-lb
+# Trên VM-LB — khởi động nginx độc lập
+docker compose -f docker-compose.lb.yml up -d nginx-lb
 
-# Gỡ LB ra không ảnh hưởng monitoring stack
-docker compose -f docker-compose.lb.yml down nginx-lb
+# Gỡ LB không ảnh hưởng VM1 hay VM2
+docker compose -f docker-compose.lb.yml down
 ```
 
 ---
@@ -4057,11 +4159,11 @@ curl -X POST http://192.168.1.35:9090/-/reload
 ## Luồng triển khai toàn bộ
 
 ```
-GIAI ĐOẠN 0 — VMware Setup:
-  VM1: Bridged network → 192.168.1.35
-  VM2: Tạo mới → Bridged → 192.168.1.36 (IP tĩnh)
-  VM2: Cài Docker Engine + Docker Compose
-  Verify: ping VM1↔VM2 đều thành công
+GIAI ĐOẠN 0 — VMware Setup (3 VM):
+  VM1  → Bridged network → 192.168.1.35 (đã có sẵn)
+  VM2  → Tạo mới → Bridged → 192.168.1.36 (IP tĩnh) → cài Docker
+  VM-LB → Tạo mới → Bridged → 192.168.1.34 (IP tĩnh) → cài Docker
+  Verify: ping 6 chiều VM1↔VM2↔VM-LB đều thành công
          │
          ▼
 GIAI ĐOẠN 1a — VM1 Setup (cert + stack):
@@ -4071,42 +4173,43 @@ GIAI ĐOẠN 1a — VM1 Setup (cert + stack):
   Verify: 5 container healthy, login API OK
          │
          ▼
-GIAI ĐOẠN 1b — Crash Test 1 (tìm ngưỡng):
+GIAI ĐOẠN 1b — Crash Test 1 (tìm ngưỡng 1 node):
   k6 crash-test.js → BASE_URL=http://192.168.1.35:5000  [từ máy test]
   Quan sát Grafana 2587 + 10915 song song
   Ghi lại: VU degraded = _____, VU collapse = _____
          │
          ▼
-GIAI ĐOẠN 2 — Setup VM2:
+GIAI ĐOẠN 2 — Setup VM2 (app node 2):
   scp source code → VM2                                  [VM1→VM2]
   scp openiddict.pfx → VM2/docker/certs/                 [VM1→VM2]
   Tạo .env trên VM2
   docker compose -f docker-compose.node2.yml up -d --build  [VM2]
-  Verify: curl VM2:5000/health → {"status":"Healthy"}
+  Verify: curl 192.168.1.36:5000/health → {"status":"Healthy"}
          │
          ▼
-GIAI ĐOẠN 3 — Load Balancer:
-  Sửa nginx.conf: điền IP VM2 (192.168.1.36:5000)        [VM1]
-  docker compose -f docker-compose.lb.yml up -d nginx-lb  [VM1]
-  Verify: curl VM1:80/lb-health → nginx-lb-ok
+GIAI ĐOẠN 3 — Setup VM-LB (dedicated Nginx):
+  scp nginx.conf + docker-compose.lb.yml → VM-LB          [VM1→VM-LB]
+  Sửa nginx.conf upstream: VM1:5000 + VM2:5000            [VM-LB]
+  docker compose -f docker-compose.lb.yml up -d nginx-lb  [VM-LB]
+  Verify: curl 192.168.1.34/lb-health → nginx-lb-ok
   Verify: docker logs nginx-lb → thấy 2 upstream xen kẽ
          │
          ▼
 GIAI ĐOẠN 4 — Verify Token Cross-Instance:
-  Login qua LB (port 80) → lấy TOKEN
-  curl -H "Bearer $TOKEN" VM1:5000/api/products → 200    [bypass LB]
-  curl -H "Bearer $TOKEN" VM2:5000/api/products → 200    [bypass LB]
+  Login qua VM-LB (http://192.168.1.34) → lấy TOKEN
+  curl -H "Bearer $TOKEN" 192.168.1.35:5000/api/products → 200  [bypass LB]
+  curl -H "Bearer $TOKEN" 192.168.1.36:5000/api/products → 200  [bypass LB]
   Nếu VM2 = 401 → DỪNG, fix cert trước
          │
          ▼
-GIAI ĐOẠN 5a — Update Prometheus:
+GIAI ĐOẠN 5a — Update Prometheus (trên VM1):
   Bỏ comment job dotnet-api-vm2 trong prometheus.yml
   curl -X POST http://192.168.1.35:9090/-/reload
   Verify: Status → Targets → 2 target UP (VM1 + VM2)
          │
          ▼
-GIAI ĐOẠN 5b — Crash Test 2 (verify scale):
-  k6 crash-test.js → BASE_URL=http://192.168.1.35:80    [qua LB]
+GIAI ĐOẠN 5b — Crash Test 2 (verify scale qua VM-LB):
+  k6 crash-test.js → BASE_URL=http://192.168.1.34       [qua VM-LB]
   Mở Grafana 2587 + 10915(VM1) + 10915(VM2) — 3 tab song song
   Điền bảng so sánh: ngưỡng tăng ~1.5–2x → thành công
 ```
