@@ -23,7 +23,7 @@ services:
 
   # ── Prometheus: Thu thập và lưu metrics theo dạng time-series ──────────────────
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.55.1
     container_name: prometheus
     ports:
       - "9090:9090"           # Web UI: http://localhost:9090
@@ -46,7 +46,7 @@ services:
 
   # ── Grafana: Visualize metrics từ Prometheus và InfluxDB ───────────────────────
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.6.1
     container_name: grafana
     ports:
       - "3000:3000"           # Web UI: http://localhost:3000 (admin/admin123)
