@@ -540,37 +540,29 @@ curl -X POST http://192.168.1.35:5000/connect/token \
 
 ---
 
-## Bước 3 — Cấu hình Grafana (phải làm lại mỗi khi chạy `down -v`)
+## Bước 3 — Cấu hình Grafana
 
-> ⚠️ **Quan trọng:** `docker compose down -v` xóa toàn bộ volume bao gồm `grafana-data` → Grafana reset về trạng thái trắng, mất hết datasource và dashboard. Phải làm lại toàn bộ Bước 3 sau mỗi lần `down -v`.
+> ℹ️ **Cả 2 datasource (InfluxDB và Prometheus) đã được auto-provisioned từ file cấu hình** trong `docker/grafana/provisioning/datasources/`. Chúng tự phục hồi mỗi khi Grafana khởi động — kể cả sau `docker compose down -v`.
 >
-> Nếu chỉ dùng `down` (không có `-v`) thì Grafana giữ nguyên cấu hình — không cần làm lại.
+> **Sau `down -v`:** Datasource tự restore, nhưng dashboard đã import bị mất → chỉ cần làm lại phần **import dashboard** (Bước 3.3).
+>
+> **Sau `down` (không `-v`):** Grafana giữ nguyên tất cả — không cần làm gì.
 
-### 3.1 Thêm datasource InfluxDB (cho k6)
-
-> InfluxDB lưu kết quả k6 — cần add để Grafana đọc được.
+### 3.1 Verify datasource InfluxDB (tự động, chỉ cần kiểm tra)
 
 1. Mở `http://192.168.1.35:3000`, login `admin / admin123`
-2. Sidebar trái → **Connections → Data Sources → Add new data source**
-3. Chọn **InfluxDB**
-4. Điền các trường sau (scroll xuống để thấy hết):
+2. Sidebar trái → **Connections → Data Sources**
+3. Kiểm tra đã có datasource tên **"influxdb"** (type: InfluxDB, URL: `http://influxdb:8086`, Database: `k6`)
+4. Click vào → kéo xuống → **Save & Test** → phải hiện **"datasource is working"**
 
-   | Trường | Giá trị | Ghi chú |
-   |--------|---------|---------|
-   | **URL** | `http://192.168.1.35:8086` | ⚠️ KHÔNG dùng `http://influxdb:8086` — Grafana UI báo "Invalid URL" với hostname không có dấu chấm |
-   | **Database** | `k6` | ⚠️ Bắt buộc — để trống sẽ lỗi "database name required" |
-   | Query Language | InfluxQL | Giữ mặc định |
-   | User / Password | *(để trống)* | InfluxDB 1.8 không cần auth mặc định |
+> Nếu không thấy datasource "influxdb" → restart Grafana: `docker restart grafana`
 
-5. Bấm **Save & Test** → phải hiện "datasource is working"
+### 3.2 Verify datasource Prometheus (tự động, chỉ cần kiểm tra)
 
-> **Tại sao dùng IP thay hostname?** Grafana frontend validate URL — hostname không có TLD như `influxdb` bị reject ở UI. Dùng IP `192.168.1.35` bypass được validation này. Port 8086 đã map ra ngoài nên Grafana backend kết nối được.
+1. Trong **Data Sources** → kiểm tra đã có datasource tên **"Prometheus"** (type: Prometheus, URL: `http://prometheus:9090`)
+2. Click vào → **Save & Test** → phải hiện **"Data source is working"**
 
-### 3.2 Thêm datasource Prometheus (cho .NET API metrics)
-
-1. **Add new data source → Prometheus**
-2. URL: `http://prometheus:9090`
-3. **Save & Test**
+> Nếu không thấy → restart Grafana: `docker restart grafana`
 
 ### 3.3 Import 3 dashboard có sẵn
 
@@ -714,11 +706,24 @@ Vào `http://192.168.1.35:9090` → Graph → gõ `http_requests_received_total`
 
 ---
 
-#### Dashboard 2587 — k6 Load Testing Results (chỉ có data khi k6 đang chạy)
+#### Dashboard 2587 — k6 Load Testing Results
 
 > Datasource InfluxDB → **panel trống là bình thường** khi chưa chạy k6.
 
 Khi k6 chạy với `--out influxdb=http://192.168.1.35:8086/k6`, dashboard này tự cập nhật real-time.
+
+> ⚠️ **Sau khi k6 xong mà dashboard vẫn trống:** Kiểm tra time range ở góc trên phải Grafana.
+> - Đổi về **"Last 15 minutes"** hoặc **"Last 1 hour"** để bao phủ thời điểm test vừa chạy.
+> - Nếu test chạy hơn 1 giờ trước → chọn "Last 3 hours" hoặc dùng absolute time range khớp với lúc test.
+>
+> **Verify data đã vào InfluxDB (chạy từ WSL/terminal):**
+> ```bash
+> curl -G "http://localhost:8086/query" \
+>   --data-urlencode "db=k6" \
+>   --data-urlencode "q=SELECT count(*) FROM http_req_duration ORDER BY time DESC LIMIT 5"
+> # Kết quả có dòng "results" với "values" → data đã vào InfluxDB ✓
+> # Kết quả "results":[{"series":[]}] → k6 chưa push data → kiểm tra lại --out flag
+> ```
 
 **Các panel quan trọng:**
 
@@ -767,18 +772,40 @@ Xác nhận thêm bằng dashboard 14282:
 
 ---
 
-#### Dashboard 2587 — k6 Load Testing Results: N/A là bình thường
+#### Dashboard 2587 — k6 Load Testing Results: N/A hoặc trống
 
-**Nguyên nhân:** InfluxDB database `k6` chưa có data — k6 chưa chạy lần nào.
+**Nguyên nhân thường gặp — theo thứ tự kiểm tra:**
 
+**A. k6 chưa chạy lần nào:**
 ```
-Dashboard 2587 chỉ có data khi k6 đang chạy với flag:
---out influxdb=http://192.168.1.35:8086/k6
-
 Trước khi chạy k6 → tất cả panel đều "No data" / N/A → ĐÚNG, không phải lỗi.
+→ Bỏ qua dashboard này cho đến Bước 4.
 ```
 
-→ **Bỏ qua dashboard này cho đến Bước 4.**
+**B. k6 đã chạy nhưng thiếu flag `--out influxdb=...`:**
+```bash
+# SAI (k6 chạy test nhưng không ghi data vào InfluxDB):
+k6 run k6/smoke-test.js
+
+# ĐÚNG (phải có --out):
+k6 run --out influxdb=http://localhost:8086/k6 k6/smoke-test.js
+```
+
+**C. Time range Grafana sai — hay gặp nhất sau khi test xong:**
+```
+k6 test chạy xong → mở Grafana → thấy dashboard trống
+→ Kiểm tra time range góc trên phải: đổi về "Last 15 minutes" hoặc "Last 1 hour"
+→ Data đột nhiên hiện ra → time range cũ đang hiện khoảng thời gian không có data
+```
+
+**D. Verify data thực sự đã vào InfluxDB:**
+```bash
+curl -G "http://localhost:8086/query" \
+  --data-urlencode "db=k6" \
+  --data-urlencode "q=SELECT count(*) FROM http_req_duration"
+# Có "values" → data đã vào → lỗi là time range
+# Không có "values" / series rỗng → data chưa vào → kiểm tra lại --out flag và URL
+```
 
 ---
 
@@ -822,12 +849,13 @@ Sau đó chờ 5-10 giây (scrape interval) → F5 lại dashboard.
 
 **Nguyên nhân thường gặp — 4 lớp (kiểm tra theo thứ tự):**
 
-**Lớp 0 — Grafana chưa được cấu hình (hay gặp nhất sau `down -v`):**
+**Lớp 0 — Dashboard chưa import (hay gặp nhất sau `down -v`):**
 
 ```
-Nếu vừa chạy docker compose down -v → Grafana bị reset hoàn toàn
-→ Cần làm lại Bước 3: thêm datasource Prometheus + InfluxDB, import lại 3 dashboard
-→ Nếu bỏ qua bước này thì dashboard 14282 không có datasource → không bao giờ có data
+Nếu vừa chạy docker compose down -v:
+→ Datasource tự phục hồi (InfluxDB + Prometheus đều auto-provisioned từ file)
+→ Nhưng dashboard đã import BỊ MẤT (lưu trong volume grafana-data đã bị xóa)
+→ Cần import lại 3 dashboard (Bước 3.3) — không cần tạo lại datasource
 ```
 
 **Lớp 1 — cAdvisor container không chạy đúng (thiếu quyền):**
@@ -1024,20 +1052,23 @@ Khi chạy load test với 1000 VU, target:
 **Mục đích:** Xác nhận script không lỗi, flow login → đọc sản phẩm → tạo đơn hàng hoạt động đúng. Không đánh giá performance.
 
 ```bash
-# Từ thư mục gốc project — gửi metrics vào InfluxDB để hiển thị trên Grafana
+# k6 cài trên máy (local) — cách này đơn giản nhất
 k6 run --out influxdb=http://localhost:8086/k6 k6/smoke-test.js
 ```
 
-Nếu không cài k6 local, dùng Docker:
+Nếu không cài k6 local, dùng Docker (phải thêm `--out influxdb` để data vào Grafana):
 ```bash
 docker run --rm -i \
   -v ${PWD}/k6:/scripts \
   grafana/k6 run \
+    --out influxdb=http://192.168.1.35:8086/k6 \
     --env BASE_URL=http://192.168.1.35:5000 \
     /scripts/smoke-test.js
 ```
 
-> API giờ chạy trong Docker và expose port 5000 ra host. k6 kết nối qua IP của server `192.168.1.35:5000` — không cần `host.docker.internal` nữa.
+> ⚠️ **Quan trọng:** Thiếu `--out influxdb=...` → k6 vẫn chạy test bình thường nhưng data KHÔNG vào InfluxDB → dashboard 2587 trống rỗng dù test thành công.
+>
+> k6 chạy trong Docker dùng IP `192.168.1.35:8086` (không dùng `localhost` vì container k6 không nằm trong cùng Docker network với InfluxDB).
 
 **Smoke test PASS khi:**
 ```
@@ -1075,7 +1106,7 @@ docker run --rm -i \
     /scripts/load-test.js
 ```
 
-> Dùng IP của server thay vì `localhost` vì k6 container không nằm trong cùng Docker network với InfluxDB và API. Cả InfluxDB (8086) lẫn API (5000) đều đã expose ra host nên truy cập được qua IP.
+> k6 Docker dùng IP `192.168.1.35` thay `localhost` — k6 container không nằm trong cùng Docker network với InfluxDB và API, phải đi qua IP của host.
 
 Trong lúc k6 chạy, **mở Grafana dashboard ID 2587** để xem real-time.
 
@@ -1397,7 +1428,7 @@ k6 báo lỗi hoặc latency cao
 [ ] curl 192.168.1.35:8086/ping → HTTP 204 (InfluxDB healthy, không có body là đúng)
 [ ] curl 192.168.1.35:8080/metrics | grep "^container_cpu" → thấy data từ cAdvisor
 [ ] 192.168.1.35:9090 → Status → Targets → dotnet-api VÀ cadvisor đều UP (xanh)
-[ ] 192.168.1.35:3000 → Grafana login được, 2 datasource đã add (Prometheus + InfluxDB)
+[ ] 192.168.1.35:3000 → Grafana login được, 2 datasource auto-provisioned: "influxdb" + "Prometheus" → Save & Test đều "working"
 [ ] Dashboard 14282 → dropdown Container có option "api" → panels hiện data
 [ ] Smoke test PASS (2 VU, 0% error)
 [ ] Mở SSMS sẵn với 3 query monitor ở trên
