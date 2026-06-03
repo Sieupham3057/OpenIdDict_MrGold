@@ -540,7 +540,11 @@ curl -X POST http://192.168.1.35:5000/connect/token \
 
 ---
 
-## Bước 3 — Cấu hình Grafana (làm 1 lần duy nhất)
+## Bước 3 — Cấu hình Grafana (phải làm lại mỗi khi chạy `down -v`)
+
+> ⚠️ **Quan trọng:** `docker compose down -v` xóa toàn bộ volume bao gồm `grafana-data` → Grafana reset về trạng thái trắng, mất hết datasource và dashboard. Phải làm lại toàn bộ Bước 3 sau mỗi lần `down -v`.
+>
+> Nếu chỉ dùng `down` (không có `-v`) thì Grafana giữ nguyên cấu hình — không cần làm lại.
 
 ### 3.1 Thêm datasource InfluxDB (cho k6)
 
@@ -816,7 +820,15 @@ Sau đó chờ 5-10 giây (scrape interval) → F5 lại dashboard.
 
 #### Dashboard 14282 — cAdvisor exporter: N/A hoặc không có data
 
-**Nguyên nhân thường gặp — 3 lớp:**
+**Nguyên nhân thường gặp — 4 lớp (kiểm tra theo thứ tự):**
+
+**Lớp 0 — Grafana chưa được cấu hình (hay gặp nhất sau `down -v`):**
+
+```
+Nếu vừa chạy docker compose down -v → Grafana bị reset hoàn toàn
+→ Cần làm lại Bước 3: thêm datasource Prometheus + InfluxDB, import lại 3 dashboard
+→ Nếu bỏ qua bước này thì dashboard 14282 không có datasource → không bao giờ có data
+```
 
 **Lớp 1 — cAdvisor container không chạy đúng (thiếu quyền):**
 
@@ -1601,7 +1613,7 @@ cAdvisor (đang chạy trong container)
 `docker stats` chỉ xem real-time trên terminal, không lưu lịch sử, không vẽ đồ thị. cAdvisor:
 - Tự động expose Prometheus metrics
 - Lưu lịch sử qua Prometheus
-- Hiện thị trong Grafana dashboard ID 893
+- Hiện thị trong Grafana dashboard ID 14282
 
 ### cAdvisor trong project này — giờ có ý nghĩa thực sự
 
