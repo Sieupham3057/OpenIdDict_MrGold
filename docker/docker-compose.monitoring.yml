@@ -90,15 +90,22 @@ services:
 
   # ── cAdvisor: Thu thập CPU/RAM/Network của Docker containers ──────────────────
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:latest
+    image: gcr.io/cadvisor/cadvisor:v0.49.1   # Pin version, không dùng latest
     container_name: cadvisor
+    privileged: true                           # Cần để đọc /proc và /sys của host
     ports:
       - "8080:8080"
     volumes:
       - /:/rootfs:ro
-      - /var/run:/var/run:ro
+      - /var/run:/var/run:rw                   # rw để đọc Docker socket (/var/run/docker.sock)
       - /sys:/sys:ro
       - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg                              # Cần để cAdvisor đọc kernel messages
+    command:
+      - '--docker_only=true'                   # Chỉ collect Docker container metrics
+      - '--housekeeping_interval=10s'          # Giảm overhead (default 1s)
     restart: unless-stopped
 
 volumes:

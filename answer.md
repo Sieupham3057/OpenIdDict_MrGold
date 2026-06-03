@@ -487,10 +487,10 @@ docker logs prometheus
 |---|---|---|
 | **API** | `http://192.168.1.35:5000/health` | `{"status":"Healthy"}` |
 | **API metrics** | `http://192.168.1.35:5000/metrics` | Hàng trăm dòng `# HELP ...` |
-| Prometheus | `http://192.168.1.35:9090` | Web UI → Status → Targets: `api` = UP |
+| Prometheus | `http://192.168.1.35:9090` | Web UI → Status → Targets: `api` và `cadvisor` = UP |
 | Grafana | `http://192.168.1.35:3000` | Login page (admin / admin123) |
 | InfluxDB | `http://192.168.1.35:8086/ping` | HTTP 204, không có body |
-| cAdvisor | `http://192.168.1.35:8080` | Dashboard container metrics |
+| cAdvisor | `http://192.168.1.35:8080/metrics` | Thấy dòng `container_cpu_usage_seconds_total{...}` |
 
 ---
 
@@ -578,7 +578,7 @@ curl -X POST http://192.168.1.35:5000/connect/token \
 |---|---|---|---|
 | `2587` | k6 Load Testing Results | InfluxDB | Kết quả k6 real-time |
 | `10915` | ASP.NET Core & Controllers | Prometheus | .NET API metrics |
-| `893` | Docker and OS metrics | Prometheus | CPU/RAM container |
+| `14282` | cAdvisor exporter | Prometheus | CPU/RAM/Network của Docker containers |
 
 > ⚠️ Nút **Import** không hiển thị trực tiếp trên trang Dashboards — phải click **New ▾** trước rồi mới thấy Import trong dropdown.
 
@@ -594,26 +594,32 @@ Vào **Dashboards** (sidebar trái) → danh sách giờ có 3 dashboard vừa i
 Dashboards
   ├── k6 Load Testing Results          ← ID 2587, datasource InfluxDB
   ├── ASP.NET Core & Controllers       ← ID 10915, datasource Prometheus
-  └── Docker and OS metrics            ← ID 893, datasource Prometheus
+  └── cAdvisor exporter                ← ID 14282, datasource Prometheus
 ```
 
 ---
 
-#### Dashboard 893 — Docker and OS metrics: ⚠️ CẦN node_exporter (chưa có trong setup)
+#### Dashboard 14282 — cAdvisor exporter: xem CPU/RAM của từng Docker container
 
-> Dashboard 893 dùng metric `node_*` từ **node_exporter** — **không phải** cAdvisor. Setup hiện tại chưa có node_exporter → toàn bộ N/A là đúng.
->
-> Xem hướng dẫn thêm node_exporter ở **section 3.5** bên dưới.
+> Datasource Prometheus → data có sẵn ngay sau khi cAdvisor chạy đúng (không cần k6).
 
-Sau khi thêm node_exporter, các panel sẽ hiện:
+**Bước bắt buộc sau khi import:**
+
+```
+1. Mở dashboard 14282
+2. Đầu trang có dropdown [Container ▾]
+3. Chọn container "api" để xem metrics của API container
+4. Dashboard tự reload → panels hiện CPU, RAM, Network của container đó
+```
 
 | Panel | Ý nghĩa | Ngưỡng cần chú ý |
 |---|---|---|
-| **CPU Usage** | % CPU máy host | > 80% liên tục → bottleneck |
-| **Memory Usage** | RAM máy host đang dùng | Tăng liên tục → leak |
-| **Disk space** | Dung lượng đĩa | > 80% → cần dọn |
-| **Network I/O** | Bytes gửi/nhận của host | Tăng khi k6 chạy là bình thường |
-| **Container uptime** | Container restart không | Restart giữa test → crash |
+| **CPU Usage** | % CPU của container (tính trên số core host) | > 80% liên tục → bottleneck |
+| **Memory Usage** | RAM container đang dùng (working set) | Tăng liên tục → memory leak |
+| **Network I/O** | Bytes gửi/nhận của container | Tăng khi k6 chạy là bình thường |
+| **Memory Cache** | Phần RAM dùng làm cache (có thể giải phóng) | Cao là bình thường |
+
+> Kết hợp với dashboard 10915 (.NET metrics): cAdvisor cho biết tầng OS container dùng bao nhiêu tài nguyên, còn Prometheus/.NET cho biết bên trong .NET GC/heap ra sao.
 
 ---
 
@@ -730,11 +736,12 @@ Khi k6 chạy với `--out influxdb=http://192.168.1.35:8086/k6`, dashboard này
 #### Workflow đọc dashboard khi load test đang chạy
 
 ```
-Mở 3 tab browser song song:
+Mở 4 tab browser song song:
 
 Tab 1 — k6 terminal     Xem progress, số liệu tổng từ k6
 Tab 2 — Dashboard 2587  Xem latency và error rate theo thời gian
 Tab 3 — Dashboard 10915 Xem .NET CPU, GC, heap — correlate với latency
+Tab 4 — Dashboard 14282 Xem container CPU/RAM qua cAdvisor (chọn container "api")
 
 Khi thấy p95 latency tăng trên dashboard 2587:
 → Chuyển sang dashboard 10915
@@ -742,6 +749,10 @@ Khi thấy p95 latency tăng trên dashboard 2587:
 → Nếu GC Gen2 tăng đúng lúc latency tăng → GC pressure là nguyên nhân
 → Nếu CPU lên 100% → CPU bottleneck
 → Nếu CPU thấp, GC bình thường nhưng latency cao → SQL Server bottleneck
+
+Xác nhận thêm bằng dashboard 14282:
+→ container_memory_usage_bytes tăng → container đang ăn nhiều RAM
+→ CPU container cao nhưng .NET CPU thấp → overhead từ OS/kernel
 ```
 
 ---
@@ -803,55 +814,53 @@ Sau đó chờ 5-10 giây (scrape interval) → F5 lại dashboard.
 
 ---
 
-#### Dashboard 893 — Docker and System Monitoring: thiếu node_exporter
+#### Dashboard 14282 — cAdvisor exporter: N/A hoặc không có data
 
-**Nguyên nhân:** Dashboard 893 yêu cầu **node_exporter** để lấy metrics hệ thống (CPU, RAM, Disk, Uptime của máy host). Setup hiện tại **không có node_exporter** — chỉ có cAdvisor.
+**Nguyên nhân thường gặp — 3 lớp:**
 
-```
-prometheus.yml hiện tại có:
-  ✓ job: dotnet-api    → API metrics
-  ✓ job: cadvisor      → container metrics
-
-  ✗ job: node_exporter → system metrics (CPU host, RAM host, Disk) — THIẾU
-```
-
-Dashboard 893 dùng metric dạng `node_cpu_seconds_total`, `node_memory_*`, `node_filesystem_*` — các metric này chỉ có từ node_exporter. Không có node_exporter → toàn bộ N/A.
-
-**Giải pháp — thêm node_exporter vào docker-compose:**
-
-Mở `docker/docker-compose.yml`, thêm service:
-
-```yaml
-  node-exporter:
-    image: prom/node-exporter:latest
-    volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /:/rootfs:ro
-    command:
-      - '--path.procfs=/host/proc'
-      - '--path.sysfs=/host/sys'
-      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
-    ports:
-      - "9100:9100"
-```
-
-Thêm vào `prometheus.yml`:
-
-```yaml
-  - job_name: 'node-exporter'
-    static_configs:
-      - targets: ['node-exporter:9100']
-```
-
-Sau đó:
+**Lớp 1 — cAdvisor container không chạy đúng (thiếu quyền):**
 
 ```bash
-docker compose up -d node-exporter
-docker compose restart prometheus
+# Kiểm tra cAdvisor đang chạy chưa
+docker ps | grep cadvisor
+
+# Xem log cAdvisor — nếu thấy "permission denied" là thiếu privileged
+docker logs cadvisor --tail 20
 ```
 
-Đợi 10 giây → F5 dashboard 893 → panels hiện data.
+cAdvisor cần `privileged: true` và device `/dev/kmsg` để đọc host metrics. Nếu thiếu → container chạy nhưng không expose được metrics.
+
+**Verify cAdvisor đang expose metrics:**
+```bash
+curl http://192.168.1.35:8080/metrics | grep "^container_cpu" | head -5
+# Kỳ vọng: thấy các dòng container_cpu_usage_seconds_total{...}
+# Nếu trống hoặc lỗi → cAdvisor chưa thu thập được metrics
+```
+
+**Lớp 2 — Prometheus chưa scrape được cAdvisor:**
+
+```
+Vào http://192.168.1.35:9090 → Status → Targets
+→ Job "cadvisor" phải State = UP (màu xanh)
+→ Nếu DOWN → kiểm tra cAdvisor container có healthy không
+```
+
+**Lớp 3 — Dashboard chưa chọn đúng container:**
+
+```
+1. Mở dashboard 14282
+2. Đầu trang có dropdown [Container ▾]
+3. Click chọn container "api" (hoặc tên container muốn xem)
+4. Nếu dropdown trống → Prometheus chưa có data từ cAdvisor (quay lại Lớp 1 & 2)
+```
+
+**Verify nhanh bằng PromQL trong Prometheus UI:**
+```promql
+# Gõ vào http://192.168.1.35:9090 → Graph:
+container_memory_usage_bytes{name="api"}
+# Nếu có data → cAdvisor đang hoạt động đúng → dashboard sẽ hiện
+# Nếu không có data → cAdvisor chưa collect được metrics → fix docker-compose
+```
 
 ---
 
@@ -1231,9 +1240,9 @@ GC Gen2 tăng liên tục  +  Heap Size không giảm
 
 ---
 
-### Dashboard cAdvisor (ID 893) — CPU/RAM của Docker containers
+### Dashboard cAdvisor (ID 14282) — CPU/RAM của Docker containers
 
-Xem panel **CPU Usage** và **Memory Usage** của các container:
+Xem panel **CPU Usage** và **Memory Usage** của các container. Chọn container `api` ở dropdown đầu trang.
 
 ```bash
 # Xem nhanh không cần Grafana
@@ -1241,13 +1250,14 @@ docker stats --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
 
 # Output mẫu khi đang load test:
 # NAME         CPU %     MEM USAGE / LIMIT
+# api          35.2%     512MiB / 16GiB     ← container .NET API
 # prometheus   2.1%      512MiB / 16GiB
 # grafana      1.3%      256MiB / 16GiB
 # influxdb     8.4%      1.2GiB / 16GiB
 # cadvisor     3.2%      128MiB / 16GiB
 ```
 
-> API giờ chạy trong Docker container (`api`) nên cAdvisor thấy được. `docker stats` sẽ hiện luôn container `api` cùng với các container monitoring.
+> cAdvisor với `--docker_only=true` chỉ theo dõi Docker container, không thu thập metrics host — giúp giảm overhead và tránh noise.
 
 ---
 
@@ -1373,8 +1383,10 @@ k6 báo lỗi hoặc latency cao
 [ ] curl 192.168.1.35:5000/health → {"status":"Healthy"}
 [ ] curl 192.168.1.35:5000/metrics → thấy dòng # HELP (không phải 404)
 [ ] curl 192.168.1.35:8086/ping → HTTP 204 (InfluxDB healthy, không có body là đúng)
-[ ] 192.168.1.35:9090 → Status → Targets → dotnet-api = UP (xanh)
-[ ] 192.168.1.35:3000 → Grafana login được, 2 datasource đã add
+[ ] curl 192.168.1.35:8080/metrics | grep "^container_cpu" → thấy data từ cAdvisor
+[ ] 192.168.1.35:9090 → Status → Targets → dotnet-api VÀ cadvisor đều UP (xanh)
+[ ] 192.168.1.35:3000 → Grafana login được, 2 datasource đã add (Prometheus + InfluxDB)
+[ ] Dashboard 14282 → dropdown Container có option "api" → panels hiện data
 [ ] Smoke test PASS (2 VU, 0% error)
 [ ] Mở SSMS sẵn với 3 query monitor ở trên
 [ ] Ghi lại thời điểm bắt đầu test để correlate với Grafana timeline
@@ -1602,7 +1614,7 @@ container_memory_usage_bytes{name="api"}            ← RAM của .NET API
 container_network_transmit_bytes_total{name="api"}  ← Network out
 ```
 
-Xem trong Grafana dashboard ID 893 → chọn container `api` để thấy resource usage theo thời gian thực trong lúc k6 chạy.
+Xem trong Grafana dashboard ID 14282 → chọn container `api` ở dropdown để thấy CPU/RAM/Network usage theo thời gian thực trong lúc k6 chạy.
 
 Kết hợp với dashboard ID 10915 (.NET metrics từ Prometheus) cho bức tranh đầy đủ:
 - cAdvisor → biết container đang dùng bao nhiêu CPU/RAM ở tầng OS
@@ -1623,7 +1635,7 @@ Câu hỏi                                      │ Tool
 "API đang xử lý bao nhiêu req/s?"            │ Grafana (ID 10915) ← Prometheus
 "p95 latency của /api/orders là bao nhiêu?"  │ Grafana (ID 10915) ← Prometheus
 "k6 đang có bao nhiêu VU, error rate?"      │ Grafana (ID 2587)  ← InfluxDB
-"Container nào đang ăn nhiều RAM nhất?"      │ Grafana (ID 893)   ← cAdvisor
+"Container nào đang ăn nhiều RAM nhất?"      │ Grafana (ID 14282) ← cAdvisor
 "Prometheus có đang scrape API không?"       │ localhost:9090 → Status → Targets
 "InfluxDB có đang sống không?"               │ curl localhost:8086/ping → 204
 "Tôi muốn test với 500 user trong 5 phút"   │ k6 (chỉnh stages trong load-test.js)
