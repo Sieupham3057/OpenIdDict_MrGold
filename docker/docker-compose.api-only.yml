@@ -1,0 +1,36 @@
+# docker-compose dùng cho VM2 — chỉ chạy API, không có monitoring.
+#
+# Điều kiện trước khi chạy:
+#   1. Copy file cert từ VM1: scp bank@192.168.1.35:~/projects/OpenIdDict_MrGold/docker/certs/openiddict.pfx ./certs/
+#   2. File cert PHẢI là cùng 1 file với VM1 (cùng private key) — không tạo cert mới trên VM2.
+#
+# Khởi động:
+#   cd ~/projects/OpenIdDict_MrGold/docker
+#   docker compose -f docker-compose.api-only.yml up -d --build
+#
+# Kiểm tra:
+#   curl http://localhost:5000/health
+
+services:
+
+  api:
+    build:
+      context: ..
+      dockerfile: AuthDemo.Api/Dockerfile
+    container_name: api
+    ports:
+      - "5000:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      # Trỏ về SQL Server ở VM1 — VM2 không chạy SQL Server riêng
+      - ConnectionStrings__DefaultConnection=Server=192.168.1.35,1433;Database=AuthDemoDB;User Id=sa;Password=YourStrong@Passw0rd;TrustServerCertificate=True;
+      # PHẢI dùng cùng cert với VM1 — token do VM1 ký thì VM2 mới validate được và ngược lại
+      - OpenIddict__CertPath=/app/certs/openiddict.pfx
+      - OpenIddict__CertPassword=Lab@OpenIddict2025
+    volumes:
+      - api-logs:/app/logs
+      - ./certs/openiddict.pfx:/app/certs/openiddict.pfx:ro
+    restart: unless-stopped
+
+volumes:
+  api-logs:

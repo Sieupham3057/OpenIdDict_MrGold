@@ -18,8 +18,14 @@ services:
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - ConnectionStrings__DefaultConnection=Server=192.168.1.35,1433;Database=AuthDemoDB;User Id=sa;Password=YourStrong@Passw0rd;TrustServerCertificate=True;
+      # Certificate dùng chung cho tất cả API instance — bắt buộc khi scale multi-instance.
+      # Tạo cert: cd docker/certs && ./gen-cert.sh
+      # Copy sang VM khác: scp certs/openiddict.pfx user@192.168.1.36:~/projects/OpenIdDict_MrGold/docker/certs/
+      - OpenIddict__CertPath=/app/certs/openiddict.pfx
+      - OpenIddict__CertPassword=Lab@OpenIddict2025
     volumes:
       - api-logs:/app/logs
+      - ./certs/openiddict.pfx:/app/certs/openiddict.pfx:ro   # Shared cert — tất cả instance phải dùng cùng file này
     restart: unless-stopped
 
   # ── InfluxDB: k6 writes load-test results here ──────────────────────────────────

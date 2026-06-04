@@ -1,0 +1,10 @@
+# Bỏ qua cert files đã sinh ra — chứa private key, không commit lên git
+*.pfx
+*.pem
+*.key
+*.crt
+*.p12
+
+# Giữ lại script sinh cert và file này
+!gen-cert.sh
+!.gitignore

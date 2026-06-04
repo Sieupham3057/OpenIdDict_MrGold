@@ -70,26 +70,38 @@ public static class OpenIddictExtensions
                 }
                 else
                 {
-                    // Production: load certificate từ file .pfx được mount vào container
-                    // QUAN TRỌNG: dùng EphemeralKeySet để .NET KHÔNG cố ghi private key
-                    // vào OS keystore (~/.dotnet/...) — sẽ lỗi quyền trên non-root container Linux
+                    // Production: load certificate từ file .pfx được mount vào container.
+                    // QUAN TRỌNG với multi-instance: tất cả instance phải dùng CÙNG 1 file .pfx.
+                    // Nếu mỗi instance dùng key riêng (ephemeral), token do instance A ký
+                    // sẽ bị instance B từ chối → user bị 401 ngẫu nhiên tùy request rơi vào instance nào.
+                    //
+                    // Tạo cert: chạy docker/certs/gen-cert.sh một lần, copy sang tất cả VM.
+                    // Mount vào container qua docker-compose volumes.
+                    //
+                    // EphemeralKeySet: .NET KHÔNG ghi private key vào OS keystore (~/.dotnet/...)
+                    // — tránh lỗi quyền trên Linux container chạy non-root user.
                     var certPath = configuration["OpenIddict:CertPath"];
                     var certPassword = configuration["OpenIddict:CertPassword"] ?? string.Empty;
 
-                    if (!string.IsNullOrEmpty(certPath) && File.Exists(certPath))
-                    {
-                        var cert = new X509Certificate2(certPath, certPassword,
-                            X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.EphemeralKeySet);
-                        options.AddEncryptionCertificate(cert)
-                               .AddSigningCertificate(cert);
-                    }
-                    else
-                    {
-                        // Fallback khi chưa cấu hình cert (Docker lab / staging)
-                        // Token sẽ bị mất hiệu lực khi container restart — chấp nhận được cho môi trường test
-                        options.AddEphemeralEncryptionKey()
-                               .AddEphemeralSigningKey();
-                    }
+                    if (string.IsNullOrEmpty(certPath))
+                        throw new InvalidOperationException(
+                            "OpenIddict: Biến môi trường 'OpenIddict__CertPath' chưa được cấu hình. " +
+                            "Khi chạy nhiều API instance, tất cả instance PHẢI dùng cùng 1 certificate " +
+                            "để token có thể validate chéo giữa các instance. " +
+                            "Chạy 'docker/certs/gen-cert.sh' để tạo cert, sau đó mount vào container " +
+                            "và set biến OpenIddict__CertPath=/app/certs/openiddict.pfx.");
+
+                    if (!File.Exists(certPath))
+                        throw new InvalidOperationException(
+                            $"OpenIddict: Không tìm thấy certificate file tại '{certPath}'. " +
+                            "Kiểm tra lại volume mount trong docker-compose.yaml " +
+                            "hoặc chạy 'docker/certs/gen-cert.sh' để tạo cert mới.");
+
+                    var cert = new X509Certificate2(certPath, certPassword,
+                        X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.EphemeralKeySet);
+
+                    options.AddEncryptionCertificate(cert)
+                           .AddSigningCertificate(cert);
                 }
 
                 // Tắt mã hóa nội dung access token — token sẽ ở dạng JWT thuần (base64)
