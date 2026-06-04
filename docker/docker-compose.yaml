@@ -45,7 +45,7 @@ services:
   # Important: use docker.sock + --docker_only=true so cAdvisor exposes labels for
   # real Docker containers like api, grafana, prometheus, sqlserver, etc.
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:latest
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
     container_name: cadvisor
     privileged: true
     ports:
