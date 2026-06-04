@@ -1,32 +1,32 @@
-# Lab k6 + InfluxDB + Prometheus + Grafana — làm thủ công dashboard để hiểu bản chất
+# Lab k6 + InfluxDB + Prometheus + Grafana — cách 2: không phụ thuộc cAdvisor
 
-Tài liệu này dùng cho bài toán hiện tại của bạn: chạy .NET API trong Docker, dùng k6 giả lập request, ghi kết quả k6 vào InfluxDB, dùng Prometheus scrape metrics từ API và cAdvisor, rồi tự tạo dashboard bằng tay trong Grafana.
+Tài liệu này dùng cho bài toán hiện tại của bạn: chạy `.NET API` trong Docker, dùng `k6` giả lập request, ghi kết quả k6 vào `InfluxDB`, dùng `Prometheus` scrape metrics từ `.NET API /metrics`, rồi tự tạo dashboard bằng tay trong Grafana.
 
-Mục tiêu của tài liệu này:
+Phiên bản này đã đổi theo **cách 2**:
 
-- Làm lại sạch từ đầu bằng `docker compose down -v`.
-- Không import dashboard community.
-- Không provision dashboard tự động.
-- Chỉ provision datasource `influxdb` và `Prometheus`.
-- Tự tạo panel trên Grafana UI để hiểu metric đến từ đâu.
-- Sửa lỗi cAdvisor không thấy container `api` bằng cấu hình `docker.sock` + `--docker_only=true`.
+- **Không dùng cAdvisor làm phần bắt buộc** cho dashboard CPU/RAM container.
+- Dùng metrics từ `.NET API /metrics` để xem **API process CPU/RAM**.
+- Dùng `docker stats` để xem **container CPU/RAM thật** khi cần.
+- Giữ phần học chính: `k6 → InfluxDB → Grafana` và `API /metrics → Prometheus → Grafana`.
 
-Thông tin môi trường đang dùng:
+Lý do bỏ cAdvisor khỏi luồng chính: trên server hiện tại, cAdvisor đọc được Docker socket nhưng không map được Docker layer, log có lỗi dạng:
 
-| Thành phần | URL |
-|---|---|
-| API | `http://192.168.1.35:5000` |
-| Swagger | `http://192.168.1.35:5000/swagger/index.html` |
-| InfluxDB | `http://192.168.1.35:8086` |
-| cAdvisor | `http://192.168.1.35:8080` |
-| Prometheus | `http://192.168.1.35:9090` |
-| Grafana | `http://192.168.1.35:3000` |
+```text
+failed to identify the read-write layer ID for container ...
+open /rootfs/var/lib/docker/image/overlayfs/layerdb/mounts/.../mount-id: no such file or directory
+```
+
+Khi đó cAdvisor chỉ expose được metric root như:
+
+```text
+container_memory_usage_bytes{id="/"} ...
+```
+
+và không có series theo container `api` / `docker-api`, nên Grafana query container CPU/RAM sẽ không có data. Đây là vấn đề compatibility với Docker storage layout, không phải bạn thao tác sai Grafana.
 
 ---
 
 ## 1. Hiểu bản chất luồng dữ liệu
-
-Có 2 luồng metrics khác nhau.
 
 ### Luồng 1 — k6 load test
 
@@ -46,36 +46,65 @@ Luồng này dùng để xem:
 
 - P95 response time.
 - Average response time.
-- Request per second.
+- Requests per second.
 - Virtual users.
 - Error rate.
 - Checks per second.
 
-### Luồng 2 — API/container monitoring
+### Luồng 2 — API monitoring
 
 ```text
-[.NET API /metrics] ----\
-                         \ scrape
-                          v
-                       [Prometheus] ---> [Grafana datasource Prometheus]
-                          ^
-                         / scrape
-[cAdvisor /metrics] -----
+[.NET API /metrics]
+    |
+    | Prometheus scrape api:8080/metrics
+    v
+[Prometheus]
+    |
+    | datasource Prometheus
+    v
+[Grafana dashboard API]
 ```
 
 Luồng này dùng để xem:
 
 - API target có UP không.
 - API request rate.
-- API p95 latency từ prometheus-net.
-- Container memory.
-- Container CPU.
+- API p95 latency.
+- API process memory.
+- API process CPU.
+- GC / thread pool nếu metric có expose.
 
-Ghi nhớ: Grafana không tự có data. Grafana chỉ đọc từ datasource.
+### Luồng 3 — Container resource xem bằng terminal
+
+```text
+[docker stats]
+    |
+    v
+CPU/RAM thật của container api, sqlserver, grafana, prometheus, influxdb
+```
+
+Khi chạy load test, mở một terminal riêng:
+
+```bash
+watch -n 2 'docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"'
+```
 
 ---
 
-## 2. Đứng đúng thư mục
+## 2. Thông tin môi trường
+
+| Thành phần | URL |
+|---|---|
+| API | `http://192.168.1.35:5000` |
+| Swagger | `http://192.168.1.35:5000/swagger/index.html` |
+| InfluxDB | `http://192.168.1.35:8086` |
+| Prometheus | `http://192.168.1.35:9090` |
+| Grafana | `http://192.168.1.35:3000` |
+| SQL Server | `192.168.1.35:1433` |
+
+---
+
+## 3. Đứng đúng thư mục
 
 ```bash
 cd ~/projects/OpenIdDict_MrGold/docker
@@ -90,9 +119,7 @@ Kỳ vọng:
 
 ---
 
-## 3. Làm sạch file cấu hình cũ
-
-Vì muốn làm lại từ đầu, xóa cấu hình Grafana/Prometheus cũ rồi tạo lại.
+## 4. Làm sạch file cấu hình cũ
 
 ```bash
 rm -rf grafana prometheus
@@ -120,14 +147,12 @@ Lưu ý: không tạo `grafana/dashboards`, vì tài liệu này hướng dẫn 
 
 ---
 
-## 4. Tạo file `docker-compose.monitoring.yml`
+## 5. Tạo `docker-compose.monitoring.yml`
 
-Tạo file đầy đủ:
+> File này **không có cAdvisor**. Ta chỉ dùng `api`, `influxdb`, `prometheus`, `grafana`.
 
 ```bash
 cat > docker-compose.monitoring.yml <<'COMPOSE'
-version: '3.8'
-
 services:
 
   # ── API: AuthDemo .NET 8 ────────────────────────────────────────────────────────
@@ -137,7 +162,7 @@ services:
       dockerfile: AuthDemo.Api/Dockerfile
     container_name: api
     ports:
-      - "5000:8080"
+      - "5000:8080"                        # Host:5000 → Container:8080
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - ConnectionStrings__DefaultConnection=Server=192.168.1.35,1433;Database=AuthDemoDB;User Id=sa;Password=YourStrong@Passw0rd;TrustServerCertificate=True;
@@ -164,32 +189,7 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # ── cAdvisor: lấy CPU/RAM/network của Docker containers ────────────────────────
-  # Quan trọng:
-  # - Dùng docker.sock để cAdvisor map được container name/image.
-  # - Dùng --docker_only=true để chỉ expose Docker container, tránh toàn system.slice.
-  cadvisor:
-    image: gcr.io/cadvisor/cadvisor:v0.49.1
-    container_name: cadvisor
-    privileged: true
-    ports:
-      - "8080:8080"
-    volumes:
-      - /:/rootfs:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /var/run:/var/run:ro
-      - /sys:/sys:ro
-      - /var/lib/docker/:/var/lib/docker:ro
-      - /dev/disk/:/dev/disk:ro
-    devices:
-      - /dev/kmsg:/dev/kmsg
-    command:
-      - "--housekeeping_interval=10s"
-      - "--docker_only=true"
-      - "--disable_metrics=disk,diskIO,hugetlb,referenced_memory,resctrl,cpuLoad,advtcp,process"
-    restart: unless-stopped
-
-  # ── Prometheus: scrape API /metrics và cAdvisor /metrics ───────────────────────
+  # ── Prometheus: scrape API /metrics ────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:v2.55.1
     container_name: prometheus
@@ -203,10 +203,7 @@ services:
       - "--storage.tsdb.retention.time=7d"
       - "--web.enable-lifecycle"
     depends_on:
-      api:
-        condition: service_healthy
-      cadvisor:
-        condition: service_started
+      - api
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
       interval: 15s
@@ -230,10 +227,8 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - grafana-data:/var/lib/grafana
     depends_on:
-      prometheus:
-        condition: service_healthy
-      influxdb:
-        condition: service_healthy
+      - prometheus
+      - influxdb
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
       interval: 15s
@@ -250,11 +245,9 @@ volumes:
 COMPOSE
 ```
 
-> Nếu `docker compose up` báo lỗi `service api has no healthcheck`, thì Dockerfile API hiện tại chưa có `HEALTHCHECK`. Khi đó đổi phần `depends_on` của Prometheus từ `condition: service_healthy` sang `condition: service_started`. Nếu `docker ps` đang hiện `api (healthy)` thì giữ nguyên như file trên.
-
 ---
 
-## 5. Tạo `prometheus/prometheus.yml`
+## 6. Tạo `prometheus/prometheus.yml`
 
 ```bash
 cat > prometheus/prometheus.yml <<'PROMETHEUS'
@@ -268,10 +261,6 @@ scrape_configs:
     static_configs:
       - targets: ['api:8080']
     metrics_path: '/metrics'
-
-  - job_name: 'cadvisor'
-    static_configs:
-      - targets: ['cadvisor:8080']
 PROMETHEUS
 ```
 
@@ -279,7 +268,7 @@ Prometheus nằm trong Docker network, nên nó gọi API bằng `api:8080`, kh�
 
 ---
 
-## 6. Tạo `grafana/grafana.ini`
+## 7. Tạo `grafana/grafana.ini`
 
 ```bash
 cat > grafana/grafana.ini <<'GRAFANA_INI'
@@ -292,7 +281,7 @@ Lý do: với InfluxDB 1.8 và Grafana mới, tắt backend migration giúp trá
 
 ---
 
-## 7. Tạo datasource InfluxDB
+## 8. Tạo datasource InfluxDB
 
 ```bash
 cat > grafana/provisioning/datasources/influxdb.yml <<'INFLUX_DS'
@@ -320,7 +309,7 @@ INFLUX_DS
 
 ---
 
-## 8. Tạo datasource Prometheus
+## 9. Tạo datasource Prometheus
 
 ```bash
 cat > grafana/provisioning/datasources/prometheus.yml <<'PROM_DS'
@@ -348,7 +337,7 @@ PROM_DS
 
 ---
 
-## 9. Down sạch volume và chạy lại
+## 10. Down sạch volume và chạy lại
 
 Lệnh này xóa sạch dữ liệu cũ của Grafana, Prometheus, InfluxDB.
 
@@ -379,14 +368,15 @@ Kỳ vọng có:
 ```text
 api
 influxdb
-cadvisor
 prometheus
 grafana
 ```
 
+`cadvisor` không còn bắt buộc trong lab này.
+
 ---
 
-## 10. Verify service bằng curl
+## 11. Verify service bằng curl
 
 ### API health
 
@@ -445,7 +435,7 @@ Kỳ vọng có:
 
 ---
 
-## 11. Verify datasource Grafana
+## 12. Verify datasource Grafana
 
 ```bash
 curl -s -u admin:admin123 http://localhost:3000/api/datasources
@@ -467,7 +457,7 @@ docker compose -f docker-compose.monitoring.yml up -d --build
 
 ---
 
-## 12. Verify Prometheus targets
+## 13. Verify Prometheus target
 
 Mở:
 
@@ -479,7 +469,6 @@ Kỳ vọng:
 
 ```text
 dotnet-api = UP
-cadvisor = UP
 ```
 
 Nếu `dotnet-api` DOWN:
@@ -489,76 +478,48 @@ docker logs api --tail 100
 curl http://localhost:5000/metrics | head
 ```
 
-Nếu `cadvisor` DOWN:
+---
+
+## 14. Verify API process metrics có tồn tại
+
+Trước khi tạo dashboard API CPU/RAM, kiểm tra metric thật:
 
 ```bash
-docker logs cadvisor --tail 100
-curl http://localhost:8080/metrics | grep '^container_' | head
+curl http://localhost:5000/metrics | grep '^process_' | head -30
+```
+
+Kỳ vọng có các metric như:
+
+```text
+process_cpu_seconds_total
+process_resident_memory_bytes
+process_virtual_memory_bytes
+process_num_threads
+```
+
+Nếu có, Prometheus query bên dưới sẽ chạy được.
+
+Kiểm tra trực tiếp trong Prometheus:
+
+```text
+http://192.168.1.35:9090/graph
+```
+
+Query:
+
+```promql
+process_resident_memory_bytes{job="dotnet-api"}
+```
+
+và:
+
+```promql
+rate(process_cpu_seconds_total{job="dotnet-api"}[1m]) * 100
 ```
 
 ---
 
-## 13. Verify cAdvisor thấy container Docker thật
-
-Đây là bước rất quan trọng trước khi tạo panel CPU/RAM container.
-
-Chạy:
-
-```bash
-curl -s http://localhost:8080/metrics \
-  | grep '^container_memory_usage_bytes' \
-  | grep -E 'api|docker-api' \
-  | head -20
-```
-
-Kỳ vọng phải có output. Ví dụ:
-
-```text
-container_memory_usage_bytes{...,image="docker-api",name="api",...} 123456789
-```
-
-hoặc:
-
-```text
-container_memory_usage_bytes{...,image="docker-api",name="/api",...} 123456789
-```
-
-Nếu không có output, xem toàn bộ container mà cAdvisor thấy:
-
-```bash
-curl -s http://localhost:8080/metrics \
-  | grep '^container_memory_usage_bytes' \
-  | grep 'image=' \
-  | head -50
-```
-
-Nếu vẫn chỉ thấy `id="/"` hoặc `id="/system.slice/..."`, nghĩa là cAdvisor chưa đọc được Docker metadata. Kiểm tra lại compose phải có:
-
-```yaml
-- /var/run/docker.sock:/var/run/docker.sock:ro
-```
-
-và command phải có:
-
-```yaml
-- "--docker_only=true"
-```
-
-Kiểm tra docker.sock trong container:
-
-```bash
-docker exec cadvisor ls -la /var/run/docker.sock
-```
-
-Nếu lỗi permission/socket không tồn tại, kiểm tra host:
-
-```bash
-ls -la /var/run/docker.sock
-```
-
----
-
-## 14. Chạy k6 để tạo dữ liệu InfluxDB
+## 15. Chạy k6 để tạo dữ liệu InfluxDB
 
 Vì đã `down -v`, InfluxDB đang rỗng. Phải chạy k6 thì dashboard k6 mới có data.
 
@@ -609,7 +570,7 @@ curl -G "http://localhost:8086/query" \
 
 ---
 
-## 15. Tạo dashboard k6 bằng tay trong Grafana
+## 16. Tạo dashboard k6 bằng tay trong Grafana
 
 Mở:
 
@@ -646,7 +607,7 @@ Test query trước, sau đó copy sang panel.
 
 ---
 
-## 15.1. Cách chọn Unit trong Grafana 11
+## 17. Cách chọn Unit trong Grafana 11
 
 Trong Grafana 11, danh sách `Unit` rất dài và không phải lúc nào cũng hiện đúng chữ `milliseconds` ngay từ đầu.
 
@@ -664,13 +625,13 @@ Các từ khóa nên gõ:
 | Seconds | `s` | Time |
 | Percent | `%` hoặc `percent` | Misc |
 | Bytes/RAM | `bytes` | Data |
-| Requests/sec | có thể để trống hoặc chọn `reqps` nếu có | Throughput |
+| Requests/sec | có thể để trống | Throughput |
 
 Nếu không tìm thấy unit, cứ để trống vẫn chạy được. Unit chỉ ảnh hưởng cách hiển thị số, không ảnh hưởng query hay dữ liệu.
 
 ---
 
-## 16. Panel k6 — P95 Response Time
+## 18. Panel k6 — P95 Response Time
 
 Datasource: `influxdb`
 
@@ -695,19 +656,11 @@ Unit trong Grafana 11:
 Standard options → Unit → gõ trực tiếp vào ô Choose: ms
 ```
 
-Sau đó chọn một trong các option sau nếu hiện ra:
-
-```text
-Time → milliseconds (ms)
-```
-
-Nếu không thấy `milliseconds`, chỉ cần gõ `ms` vào ô `Choose` rồi chọn option có ký hiệu `ms`.
-
-Lưu ý: đừng dùng Ctrl+F của trình duyệt để tìm `unit`. Hãy click vào ô `Choose` trong phần `Unit` của Grafana rồi gõ `ms`.
+Sau đó chọn option có ký hiệu `ms`.
 
 ---
 
-## 17. Panel k6 — Average Response Time
+## 19. Panel k6 — Average Response Time
 
 ```sql
 SELECT mean("value")
@@ -725,12 +678,12 @@ Average Response Time
 Unit:
 
 ```text
-milliseconds / ms
+ms
 ```
 
 ---
 
-## 18. Panel k6 — Requests Per Second
+## 20. Panel k6 — Requests Per Second
 
 ```sql
 SELECT sum("value")
@@ -747,7 +700,7 @@ Requests Per Second
 
 ---
 
-## 19. Panel k6 — Virtual Users
+## 21. Panel k6 — Virtual Users
 
 ```sql
 SELECT mean("value")
@@ -764,7 +717,7 @@ Virtual Users
 
 ---
 
-## 20. Panel k6 — Error Rate %
+## 22. Panel k6 — Error Rate %
 
 ```sql
 SELECT mean("value") * 100
@@ -787,7 +740,7 @@ percent / %
 
 ---
 
-## 21. Panel k6 — Checks Per Second
+## 23. Panel k6 — Checks Per Second
 
 ```sql
 SELECT sum("value")
@@ -804,7 +757,7 @@ Checks Per Second
 
 ---
 
-## 22. Lưu dashboard k6
+## 24. Lưu dashboard k6
 
 Bấm **Save**.
 
@@ -833,7 +786,7 @@ k6 run \
 
 ---
 
-## 23. Tạo dashboard Prometheus bằng tay
+## 25. Tạo dashboard API bằng tay với Prometheus
 
 Tạo dashboard mới:
 
@@ -843,7 +796,7 @@ Dashboards → New → New dashboard → Add visualization → datasource Promet
 
 ---
 
-## 24. Panel Prometheus — API Target UP
+## 26. Panel Prometheus — API Target UP
 
 PromQL:
 
@@ -864,12 +817,12 @@ Giá trị:
 
 ---
 
-## 25. Panel Prometheus — API Request Rate
+## 27. Panel Prometheus — API Request Rate
 
-Thử query này:
+PromQL:
 
 ```promql
-sum(rate(http_requests_received_total[1m]))
+sum(rate(http_requests_received_total{job="dotnet-api"}[1m]))
 ```
 
 Title:
@@ -894,12 +847,12 @@ http_
 
 ---
 
-## 26. Panel Prometheus — API P95 Latency
+## 28. Panel Prometheus — API P95 Latency
 
 PromQL:
 
 ```promql
-histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))
+histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="dotnet-api"}[5m])) by (le))
 ```
 
 Title:
@@ -922,169 +875,138 @@ curl http://localhost:5000/metrics | grep 'duration_seconds_bucket' | head
 
 ---
 
-## 27. Panel Prometheus — API Container Memory
+## 29. Panel Prometheus — API Process Memory
 
-Trước khi tạo panel, kiểm tra Prometheus có data không:
-
-```promql
-container_memory_usage_bytes
-```
-
-Sau đó tìm label của API bằng terminal:
-
-```bash
-curl -s http://localhost:8080/metrics \
-  | grep '^container_memory_usage_bytes' \
-  | grep -E 'api|docker-api' \
-  | head -20
-```
-
-PromQL khuyên dùng:
+PromQL:
 
 ```promql
-container_memory_usage_bytes{name=~".*api.*|.*docker-api.*", image!=""}
+process_resident_memory_bytes{job="dotnet-api"}
 ```
 
 Title:
 
 ```text
-API Container Memory
+API Process Memory
 ```
 
 Unit trong Grafana 11:
 
 ```text
-Standard options → Unit → gõ trực tiếp vào ô Choose: bytes
+Standard options → Unit → gõ vào ô Choose: bytes
 ```
 
-Sau đó chọn:
+Sau đó chọn option có chữ `bytes`.
 
-```text
-Data → bytes (IEC)
-```
+Ý nghĩa:
 
-hoặc option có chữ `bytes`.
-
-Quan trọng: trong Prometheus regex là full-match. Query dưới đây dễ không ra data:
-
-```promql
-container_memory_usage_bytes{name=~"api|docker-api"}
-```
-
-Vì nó chỉ match chính xác `api` hoặc `docker-api`, không match `/api`, `docker-api:latest`, hoặc label có prefix/suffix. Dùng `.*api.*` an toàn hơn khi học.
+- Đây là RAM resident của process `.NET` bên trong container API.
+- Không phải toàn bộ container memory.
+- Với container API chỉ chạy một process chính `.NET`, metric này đủ hữu ích để theo dõi memory của API khi load test.
 
 ---
 
-## 28. Panel Prometheus — API Container CPU
+## 30. Panel Prometheus — API Process CPU %
 
-PromQL dạng CPU percent:
+PromQL:
 
 ```promql
-rate(container_cpu_usage_seconds_total{name=~".*api.*|.*docker-api.*", image!=""}[1m]) * 100
+rate(process_cpu_seconds_total{job="dotnet-api"}[1m]) * 100
 ```
 
 Title:
 
 ```text
-API Container CPU %
+API Process CPU %
 ```
 
 Unit trong Grafana 11:
 
 ```text
-Standard options → Unit → gõ trực tiếp vào ô Choose: percent
+Standard options → Unit → gõ vào ô Choose: percent
 ```
 
-Sau đó chọn:
+Hoặc gõ `%`.
 
-```text
-Misc → percent (0-100)
-```
+Ý nghĩa:
 
-Nếu không thấy, gõ `%`.
-
-Nếu muốn xem giá trị theo core, không nhân 100:
-
-```promql
-rate(container_cpu_usage_seconds_total{name=~".*api.*|.*docker-api.*", image!=""}[1m])
-```
-
-Ví dụ `0.25` nghĩa là khoảng 25% của 1 core.
+- Đây là CPU usage của process API.
+- Nếu giá trị khoảng `50`, hiểu là process dùng khoảng 50% của 1 CPU core.
+- Nếu máy 2 core, giá trị có thể vượt 100 nếu process dùng hơn 1 core.
 
 ---
 
-## 29. Nếu panel container Memory/CPU không có data
+## 31. Panel Prometheus — API Threads
 
-Làm theo thứ tự này.
-
-### Bước 1 — Prometheus có metric container chưa?
-
-Mở Prometheus Graph:
-
-```text
-http://192.168.1.35:9090/graph
-```
-
-Chạy:
+Nếu metric tồn tại:
 
 ```promql
-container_memory_usage_bytes
+process_num_threads{job="dotnet-api"}
 ```
 
-Nếu không có data, Prometheus chưa scrape được cAdvisor hoặc cAdvisor không expose metric.
+Title:
 
-### Bước 2 — cAdvisor có thấy container API không?
-
-```bash
-curl -s http://localhost:8080/metrics \
-  | grep '^container_memory_usage_bytes' \
-  | grep -E 'api|docker-api' \
-  | head -20
-```
-
-Nếu không có output, kiểm tra compose cAdvisor.
-
-### Bước 3 — Compose cAdvisor phải là docker.sock + docker_only
-
-Trong `docker-compose.monitoring.yml`, service `cadvisor` phải có:
-
-```yaml
-volumes:
-  - /var/run/docker.sock:/var/run/docker.sock:ro
-command:
-  - "--docker_only=true"
-```
-
-Không dùng bản containerd này cho lab hiện tại:
-
-```yaml
-- /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
-- "--containerd=/run/containerd/containerd.sock"
-- "--containerd-namespace=moby"
-```
-
-### Bước 4 — Recreate cAdvisor và Prometheus
-
-```bash
-cd ~/projects/OpenIdDict_MrGold/docker
-
-docker compose -f docker-compose.monitoring.yml stop cadvisor prometheus
-docker compose -f docker-compose.monitoring.yml rm -f cadvisor prometheus
-docker compose -f docker-compose.monitoring.yml up -d cadvisor prometheus
-```
-
-Đợi 30 giây rồi kiểm tra lại:
-
-```bash
-curl -s http://localhost:8080/metrics \
-  | grep '^container_memory_usage_bytes' \
-  | grep -E 'api|docker-api' \
-  | head -20
+```text
+API Process Threads
 ```
 
 ---
 
-## 30. Debug k6 dashboard không có data
+## 32. Panel Prometheus — .NET GC Gen2
+
+Kiểm tra metric thật trước:
+
+```bash
+curl http://localhost:5000/metrics | grep -i 'gc' | head -50
+```
+
+Nếu có `dotnet_gc_collections_total`, dùng:
+
+```promql
+rate(dotnet_gc_collections_total{job="dotnet-api"}[5m])
+```
+
+Title:
+
+```text
+.NET GC Collections Rate
+```
+
+Nếu metric có label `generation`, có thể tách Gen2:
+
+```promql
+rate(dotnet_gc_collections_total{job="dotnet-api",generation="2"}[5m])
+```
+
+---
+
+## 33. Xem container CPU/RAM thật bằng `docker stats`
+
+Vì không dùng cAdvisor làm nguồn chính, khi cần xem container resource thật thì dùng terminal:
+
+```bash
+docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"
+```
+
+Khi chạy k6, mở terminal riêng:
+
+```bash
+watch -n 2 'docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"'
+```
+
+Bạn sẽ thấy kiểu:
+
+```text
+NAME         CPU %     MEM USAGE / LIMIT     MEM %
+api          35.2%     512MiB / 16GiB        3.2%
+sqlserver    8.4%      2.1GiB / 16GiB        13.1%
+influxdb     3.2%      300MiB / 16GiB        1.8%
+prometheus   1.5%      120MiB / 16GiB        0.7%
+grafana      0.8%      180MiB / 16GiB        1.1%
+```
+
+---
+
+## 34. Debug k6 dashboard không có data
 
 ### InfluxDB có measurement không?
 
@@ -1133,26 +1055,83 @@ Last 6 hours
 
 ---
 
-## 31. Checklist cuối cùng
+## 35. Debug API Prometheus dashboard không có data
+
+### Prometheus target có UP không?
+
+Mở:
 
 ```text
-[ ] docker ps có api, influxdb, cadvisor, prometheus, grafana
-[ ] curl localhost:5000/health OK
-[ ] curl localhost:5000/metrics có # HELP
-[ ] curl -i localhost:8086/ping trả 204
-[ ] Prometheus /targets: dotnet-api UP, cadvisor UP
-[ ] Grafana datasource có đúng 2 cái: influxdb và Prometheus
-[ ] cAdvisor thấy container api/docker-api trong container_memory_usage_bytes
-[ ] Chạy k6 với --out influxdb=http://localhost:8086/k6
-[ ] InfluxDB SHOW MEASUREMENTS có http_req_duration
-[ ] Grafana Explore datasource influxdb query ra data
-[ ] Dashboard k6 tự tạo bằng tay có panel P95, RPS, VU, Error Rate
-[ ] Dashboard Prometheus có API Target UP, API Container Memory, API Container CPU
+http://192.168.1.35:9090/targets
+```
+
+Kỳ vọng:
+
+```text
+dotnet-api = UP
+```
+
+### API có expose metric không?
+
+```bash
+curl http://localhost:5000/metrics | grep '^process_' | head
+curl http://localhost:5000/metrics | grep '^http_' | head
+```
+
+### Prometheus có ingest metric không?
+
+Vào Prometheus Graph chạy:
+
+```promql
+up{job="dotnet-api"}
+```
+
+```promql
+process_resident_memory_bytes{job="dotnet-api"}
+```
+
+```promql
+rate(process_cpu_seconds_total{job="dotnet-api"}[1m]) * 100
 ```
 
 ---
 
-## 32. Lệnh thường dùng
+## 36. Ghi chú về cAdvisor
+
+cAdvisor không còn là phần bắt buộc trong tài liệu này.
+
+Nếu sau này muốn thử lại cAdvisor, cần hiểu:
+
+- cAdvisor phải expose được metric có label `image`/`name` của container.
+- Nếu chỉ có `container_memory_usage_bytes{id="/"}`, thì không dùng được để vẽ CPU/RAM từng container.
+- Lỗi `failed to identify the read-write layer ID` cho thấy cAdvisor không tương thích với Docker storage layout hiện tại.
+- Khi đó dùng `.NET process metrics` + `docker stats` là hướng thực tế hơn cho lab này.
+
+---
+
+## 37. Checklist cuối cùng
+
+```text
+[ ] docker ps có api, influxdb, prometheus, grafana
+[ ] curl localhost:5000/health OK
+[ ] curl localhost:5000/metrics có # HELP
+[ ] curl localhost:5000/metrics có process_cpu_seconds_total
+[ ] curl localhost:5000/metrics có process_resident_memory_bytes
+[ ] curl -i localhost:8086/ping trả 204
+[ ] Prometheus /targets: dotnet-api UP
+[ ] Grafana datasource có đúng 2 cái: influxdb và Prometheus
+[ ] Chạy k6 với --out influxdb=http://localhost:8086/k6
+[ ] InfluxDB SHOW MEASUREMENTS có http_req_duration
+[ ] Grafana Explore datasource influxdb query ra data
+[ ] Dashboard k6 tự tạo bằng tay có panel P95, RPS, VU, Error Rate
+[ ] Dashboard API có API Target UP, API Request Rate, API P95 Latency
+[ ] Dashboard API có API Process Memory, API Process CPU %
+[ ] Terminal docker stats xem được container CPU/RAM thật
+```
+
+---
+
+## 38. Lệnh thường dùng
 
 Restart toàn stack:
 
@@ -1165,12 +1144,6 @@ Xem log API:
 
 ```bash
 docker logs api --tail 100 -f
-```
-
-Xem log cAdvisor:
-
-```bash
-docker logs cadvisor --tail 100 -f
 ```
 
 Xem log Prometheus:
@@ -1193,14 +1166,20 @@ docker compose -f docker-compose.monitoring.yml down -v
 docker compose -f docker-compose.monitoring.yml up -d --build
 ```
 
+Xem container resource khi chạy k6:
+
+```bash
+watch -n 2 'docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"'
+```
+
 ---
 
-## 33. Ghi nhớ quan trọng
+## 39. Ghi nhớ quan trọng
 
 - `down -v` xóa sạch InfluxDB data, nên phải chạy lại k6.
 - Grafana datasource có thể provision tự động.
 - Dashboard nếu muốn học bản chất thì tự tạo bằng UI.
 - Dashboard community như ID `2587` có thể không khớp schema/version, không nên phụ thuộc.
 - Query k6 phải dựa trên measurement thật trong InfluxDB: `http_req_duration`, `http_reqs`, `vus`, `checks`, `http_req_failed`.
-- Query cAdvisor phải dựa trên label thật mà cAdvisor expose.
-- Với Prometheus regex, `name=~"api|docker-api"` là match chính xác. Khi không chắc label, dùng `name=~".*api.*|.*docker-api.*"`.
+- Query API Prometheus phải dựa trên metric thật từ `/metrics`: `http_*`, `process_*`, `dotnet_*`.
+- cAdvisor là optional trong lab này. Nếu không expose được container label, bỏ qua và dùng `docker stats`.
