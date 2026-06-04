@@ -646,6 +646,30 @@ Test query trước, sau đó copy sang panel.
 
 ---
 
+## 15.1. Cách chọn Unit trong Grafana 11
+
+Trong Grafana 11, danh sách `Unit` rất dài và không phải lúc nào cũng hiện đúng chữ `milliseconds` ngay từ đầu.
+
+Cách chọn chuẩn:
+
+```text
+Panel bên phải → Standard options → Unit → click ô Choose → gõ từ khóa
+```
+
+Các từ khóa nên gõ:
+
+| Muốn hiển thị | Gõ vào ô Unit | Thường nằm trong nhóm |
+|---|---|---|
+| Milliseconds | `ms` | Time |
+| Seconds | `s` | Time |
+| Percent | `%` hoặc `percent` | Misc |
+| Bytes/RAM | `bytes` | Data |
+| Requests/sec | có thể để trống hoặc chọn `reqps` nếu có | Throughput |
+
+Nếu không tìm thấy unit, cứ để trống vẫn chạy được. Unit chỉ ảnh hưởng cách hiển thị số, không ảnh hưởng query hay dữ liệu.
+
+---
+
 ## 16. Panel k6 — P95 Response Time
 
 Datasource: `influxdb`
@@ -665,11 +689,21 @@ Title:
 P95 Response Time
 ```
 
-Unit:
+Unit trong Grafana 11:
 
 ```text
-milliseconds / ms
+Standard options → Unit → gõ trực tiếp vào ô Choose: ms
 ```
+
+Sau đó chọn một trong các option sau nếu hiện ra:
+
+```text
+Time → milliseconds (ms)
+```
+
+Nếu không thấy `milliseconds`, chỉ cần gõ `ms` vào ô `Choose` rồi chọn option có ký hiệu `ms`.
+
+Lưu ý: đừng dùng Ctrl+F của trình duyệt để tìm `unit`. Hãy click vào ô `Choose` trong phần `Unit` của Grafana rồi gõ `ms`.
 
 ---
 
@@ -917,11 +951,19 @@ Title:
 API Container Memory
 ```
 
-Unit:
+Unit trong Grafana 11:
 
 ```text
-bytes
+Standard options → Unit → gõ trực tiếp vào ô Choose: bytes
 ```
+
+Sau đó chọn:
+
+```text
+Data → bytes (IEC)
+```
+
+hoặc option có chữ `bytes`.
 
 Quan trọng: trong Prometheus regex là full-match. Query dưới đây dễ không ra data:
 
@@ -947,11 +989,19 @@ Title:
 API Container CPU %
 ```
 
-Unit:
+Unit trong Grafana 11:
 
 ```text
-percent / %
+Standard options → Unit → gõ trực tiếp vào ô Choose: percent
 ```
+
+Sau đó chọn:
+
+```text
+Misc → percent (0-100)
+```
+
+Nếu không thấy, gõ `%`.
 
 Nếu muốn xem giá trị theo core, không nhân 100:
 
