@@ -9,6 +9,7 @@
 - [Phase 4 — Cập nhật Prometheus scrape cả 2 API](#phase-4--cập-nhật-prometheus-scrape-cả-2-api)
 - [Phase 5 — Chạy lại k6 sau khi scale và so sánh](#phase-5--chạy-lại-k6-sau-khi-scale-và-so-sánh)
 - [Hiểu kết quả — Đọc dashboard trước và sau scale](#hiểu-kết-quả--đọc-dashboard-trước-và-sau-scale)
+- [Khi Database là bottleneck — Scale DB Layer](#khi-database-là-bottleneck--scale-db-layer)
 - [Debug thường gặp](#debug-thường-gặp)
 - [Checklist cuối cùng](#checklist-cuối-cùng)
 
@@ -112,12 +113,21 @@ chmod +x gen-cert.sh
 ./gen-cert.sh
 ```
 
-Verify cert đã tồn tại:
+Verify cert đã tồn tại và có permissions đúng:
 
 ```bash
 ls -lh ~/projects/OpenIdDict_MrGold/docker/certs/
-# Kỳ vọng: thấy openiddict.pfx (~4KB)
+# Kỳ vọng: thấy openiddict.pfx (~4KB) với permissions -rw-r--r-- (644)
+
+# Verify file PFX hợp lệ (không có output lỗi = tốt)
+openssl pkcs12 -in ~/projects/OpenIdDict_MrGold/docker/certs/openiddict.pfx \
+  -noout -passin pass:Lab@OpenIddict2025
 ```
+
+> **Lưu ý permissions:** `gen-cert.sh` tự động đặt `chmod 644` cho file `.pfx` sau khi tạo. Container chạy bằng user `appuser` (uid 1001, không phải `bank`) — nếu file là `600` (owner-only), container không đọc được và crash với lỗi `BIO routines::system lib`. Nếu bạn sinh cert bằng script cũ hoặc bằng tay, chạy thêm:
+> ```bash
+> chmod 644 ~/projects/OpenIdDict_MrGold/docker/certs/openiddict.pfx
+> ```
 
 ### Bước 0.4 — Khởi động lại stack
 
@@ -138,6 +148,16 @@ Application started. Press Ctrl+C to shut down.
 ```
 
 Nếu thấy `InvalidOperationException` → cert chưa được mount đúng, kiểm tra lại Bước 0.3.
+
+**Nếu container `api` báo unhealthy và `docker compose up -d` vẫn lỗi dù đã fix cert:**
+
+`docker compose up -d` không tự force-recreate container đang trong restart loop — nó chỉ report lại trạng thái cũ. Cần xóa container cũ và tạo lại:
+
+```bash
+docker stop api && docker rm api
+docker compose -f docker-compose.yaml up -d
+docker logs api --tail 30
+```
 
 Verify toàn bộ stack healthy:
 
@@ -866,6 +886,370 @@ Latency p95 (ms)
 
 ---
 
+## Khi Database là bottleneck — Scale DB Layer
+
+> **Bối cảnh:** API đã scale ngang được (stateless, nhiều instance). Database là shared state — không thể scale ngang đơn giản như API. Phần này áp dụng khi DB ở server riêng (không chung VM với API) và bắt đầu quá tải.
+
+### Nhận biết DB đang là bottleneck
+
+Dấu hiệu trên Grafana / monitoring:
+
+```
+✗ API latency cao nhưng CPU API thấp → thời gian chờ ở DB, không phải CPU API
+✗ CPU DB server cao (>80%) liên tục
+✗ Connection wait time tăng trong DB metrics
+✗ Throughput API không tăng dù thêm instance → cổ chai không phải ở API
+```
+
+Kiểm tra nhanh số connection đang mở (SQL Server):
+
+```sql
+-- Chạy trên SQL Server
+SELECT DB_NAME(dbid) AS db, COUNT(*) AS connections
+FROM sys.sysprocesses
+WHERE dbid > 0
+GROUP BY dbid
+ORDER BY connections DESC;
+
+-- Xem query nào đang chạy lâu nhất
+SELECT TOP 10
+    qs.total_elapsed_time / qs.execution_count AS avg_elapsed_ms,
+    qs.execution_count,
+    SUBSTRING(qt.text, (qs.statement_start_offset/2)+1,
+        ((CASE qs.statement_end_offset WHEN -1 THEN DATALENGTH(qt.text)
+          ELSE qs.statement_end_offset END - qs.statement_start_offset)/2)+1) AS query_text
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt
+ORDER BY avg_elapsed_ms DESC;
+```
+
+Kiểm tra nhanh (PostgreSQL):
+
+```sql
+-- Số connection hiện tại
+SELECT count(*), state FROM pg_stat_activity GROUP BY state;
+
+-- Query chạy lâu nhất
+SELECT pid, now() - pg_stat_activity.query_start AS duration, query, state
+FROM pg_stat_activity
+WHERE (now() - pg_stat_activity.query_start) > interval '1 second'
+ORDER BY duration DESC;
+```
+
+---
+
+### Giải pháp 1 — Tune Connection Pool (làm đầu tiên, miễn phí)
+
+**Vấn đề:** Mỗi API instance giữ một pool connection riêng. 2 instance × max 100 connection = 200 connection đến DB. Khi tải cao, pool bị cạn → request phải chờ connection rảnh → latency tăng.
+
+**Trong connection string của .NET**, thêm các tham số pool:
+
+```
+# SQL Server
+Server=192.168.1.xx,1433;Database=AuthDemoDB;
+User Id=sa;Password=...;TrustServerCertificate=True;
+Max Pool Size=50;           # tối đa connection per instance (default 100)
+Min Pool Size=5;            # giữ sẵn connection (tránh overhead tạo mới)
+Connection Timeout=30;      # giây chờ lấy connection trước khi throw exception
+```
+
+```
+# PostgreSQL
+Host=192.168.1.xx;Port=5432;Database=mydb;Username=myuser;Password=...;
+Maximum Pool Size=50;
+Minimum Pool Size=5;
+Connection Timeout=30;
+```
+
+**Tính toán Max Pool Size hợp lý:**
+
+```
+DB max connections = 200 (ví dụ)
+Số API instance     = 2
+Reserve cho admin   = 10
+
+Max Pool Size per instance = (200 - 10) / 2 = 95
+→ Đặt Max Pool Size=90 để an toàn
+```
+
+> Với SQL Server, giới hạn connection mặc định rất cao (32767). Với PostgreSQL, mặc định chỉ 100 — quan trọng hơn nhiều.
+
+---
+
+### Giải pháp 2 — Redis Cache (giảm số lần đọc DB)
+
+**Nguyên lý:** Phần lớn request là READ (GET user info, GET danh sách, ...). Nếu cache kết quả ở Redis, DB chỉ bị gọi lần đầu — các request tiếp theo lấy từ cache.
+
+```
+Không cache:  1000 request/s → 1000 DB query/s
+Có cache:     1000 request/s → ~10 DB query/s (chỉ cache miss mới gọi DB)
+```
+
+**Kiến trúc sau khi thêm Redis:**
+
+```
+[k6] → [Nginx :80] → [API VM1 :5000] ─┐
+                    → [API VM2 :5000] ─┼→ [Redis :6379] → (cache hit → trả về ngay)
+                                        └→ [SQL Server :1433] → (cache miss → query DB → lưu Redis)
+```
+
+**Thêm Redis vào docker-compose trên VM DB server (hoặc VM riêng):**
+
+```yaml
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+```
+
+**Trong .NET — cài package và dùng:**
+
+```bash
+dotnet add package Microsoft.Extensions.Caching.StackExchangeRedis
+```
+
+```csharp
+// Program.cs
+builder.Services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = builder.Configuration["Redis:ConnectionString"];
+    // ví dụ: "192.168.1.xx:6379"
+});
+```
+
+```csharp
+// Trong controller/service — pattern cache-aside
+public async Task<UserInfo> GetUserInfoAsync(string userId)
+{
+    var cacheKey = $"user:info:{userId}";
+
+    // Thử lấy từ cache trước
+    var cached = await _cache.GetStringAsync(cacheKey);
+    if (cached != null)
+        return JsonSerializer.Deserialize<UserInfo>(cached);
+
+    // Cache miss → query DB
+    var user = await _db.Users.FindAsync(userId);
+
+    // Lưu vào cache, TTL 5 phút
+    await _cache.SetStringAsync(cacheKey, JsonSerializer.Serialize(user),
+        new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5) });
+
+    return user;
+}
+```
+
+> **Lưu ý invalidation:** Khi user cập nhật thông tin, phải xóa cache tương ứng (`_cache.RemoveAsync(cacheKey)`), nếu không user thấy data cũ.
+
+---
+
+### Giải pháp 3 — Read Replica (scale đọc ngang)
+
+**Nguyên lý:** DB chia làm 2 vai trò:
+- **Primary (master):** nhận tất cả WRITE (INSERT, UPDATE, DELETE)
+- **Replica (slave):** nhận tất cả READ (SELECT) — sync data từ primary liên tục
+
+```
+[API] → Write request → [DB Primary :5432/1433]
+                                │
+                          replication
+                                │
+[API] → Read request  → [DB Replica :5432/1433]
+```
+
+Vì ~80–90% request thường là READ → replica gánh phần lớn tải → primary nhẹ hơn nhiều.
+
+#### SQL Server — AlwaysOn Availability Group
+
+```
+Yêu cầu: SQL Server Enterprise hoặc Developer Edition
+         (Standard Edition chỉ hỗ trợ Basic AG, 1 database per group)
+
+Kiến trúc tối giản:
+  Primary: 192.168.1.xx  — nhận read + write
+  Secondary: 192.168.1.yy — nhận read-only (readable secondary)
+```
+
+Trong connection string .NET để tự động route:
+
+```
+# Kết nối Primary cho write
+Server=192.168.1.xx,1433;Database=AuthDemoDB;...;ApplicationIntent=ReadWrite
+
+# Kết nối Secondary cho read
+Server=192.168.1.yy,1433;Database=AuthDemoDB;...;ApplicationIntent=ReadOnly
+```
+
+Hoặc dùng AG Listener (DNS name tự route):
+
+```
+Server=ag-listener,1433;Database=AuthDemoDB;...;ApplicationIntent=ReadOnly
+# Listener tự biết chuyển ReadOnly → secondary, ReadWrite → primary
+```
+
+#### PostgreSQL — Streaming Replication
+
+PostgreSQL native replication đơn giản hơn SQL Server, không cần license đặc biệt.
+
+**Trên Primary server** — cho phép replication:
+
+```bash
+# postgresql.conf
+wal_level = replica
+max_wal_senders = 3
+wal_keep_size = 256MB   # giữ WAL đủ lâu cho replica đồng bộ
+```
+
+```bash
+# pg_hba.conf — cho phép replica user kết nối
+host  replication  replicator  192.168.1.yy/32  md5
+```
+
+**Trên Replica server** — pull data từ primary:
+
+```bash
+# Lấy base backup từ primary
+pg_basebackup -h 192.168.1.xx -U replicator -D /var/lib/postgresql/data -P -Xs -R
+# -R tự tạo file standby.signal và postgresql.auto.conf
+```
+
+```bash
+# postgresql.auto.conf (tự sinh bởi -R)
+primary_conninfo = 'host=192.168.1.xx port=5432 user=replicator password=...'
+```
+
+Replica sẽ ở chế độ read-only tự động — mọi SELECT đều chạy được, INSERT/UPDATE sẽ báo lỗi.
+
+**Trong .NET — dùng Npgsql với read/write routing:**
+
+```csharp
+// Cài package
+// dotnet add package Npgsql.EntityFrameworkCore.PostgreSQL
+
+// Cấu hình 2 connection string
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseNpgsql(builder.Configuration.GetConnectionString("Primary")));
+
+// DbContext thứ 2 cho read-only operations
+builder.Services.AddDbContext<ReadOnlyDbContext>(options =>
+    options.UseNpgsql(builder.Configuration.GetConnectionString("Replica")));
+```
+
+```
+# appsettings.json
+"ConnectionStrings": {
+  "Primary": "Host=192.168.1.xx;Database=mydb;Username=app;Password=...;",
+  "Replica": "Host=192.168.1.yy;Database=mydb;Username=app;Password=...;Target Session Attributes=read-only;"
+}
+```
+
+---
+
+### Giải pháp 4 — PgBouncer (bắt buộc với PostgreSQL ở tải cao)
+
+> **Chỉ cần cho PostgreSQL.** SQL Server dùng thread-based model nên xử lý nhiều connection tốt hơn. PostgreSQL dùng process-based model — mỗi connection tạo 1 process riêng → 500 connection = 500 process OS → tốn RAM và context switch cực nhiều.
+
+**PgBouncer là connection pooler** đứng giữa API và PostgreSQL:
+
+```
+[API instance 1]  ─┐
+[API instance 2]  ─┼→ [PgBouncer :5432] → [PostgreSQL :5432]
+[API instance 3]  ─┘    (pool 20 conn)      (chỉ nhận 20 conn thật)
+  (mỗi cái 100 conn)
+  = 300 conn đến PgBouncer
+```
+
+PgBouncer nhận 300 connection từ API nhưng chỉ giữ 20 connection thật đến PostgreSQL — multiplexing request.
+
+**Docker Compose cho PgBouncer:**
+
+```yaml
+services:
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: pgbouncer
+    ports:
+      - "5432:5432"     # API kết nối vào đây thay vì PostgreSQL trực tiếp
+    environment:
+      - DB_HOST=192.168.1.xx   # IP PostgreSQL thật
+      - DB_PORT=5432
+      - DB_USER=myuser
+      - DB_PASSWORD=mypassword
+      - DB_NAME=mydb
+      - POOL_MODE=transaction   # transaction pooling — hiệu quả nhất
+      - MAX_CLIENT_CONN=1000    # số connection từ API đến PgBouncer
+      - DEFAULT_POOL_SIZE=20    # số connection thật từ PgBouncer đến PostgreSQL
+    restart: unless-stopped
+```
+
+**3 chế độ pooling của PgBouncer:**
+
+| Mode | Mô tả | Dùng khi |
+|------|-------|----------|
+| `session` | 1 client = 1 server connection suốt session | ứng dụng dùng session-level features |
+| `transaction` | 1 server connection chỉ bị giữ trong duration của transaction | **khuyến nghị** cho stateless API |
+| `statement` | Pool lại sau mỗi statement | ít dùng, không hỗ trợ transaction nhiều statement |
+
+> **Với stateless API như AuthDemo:** dùng `transaction` mode. Sau khi transaction commit/rollback, connection được trả lại pool ngay — không chờ HTTP request kết thúc.
+
+**Sau khi có PgBouncer** — đổi connection string trong API:
+
+```
+# Trước: kết nối thẳng PostgreSQL
+Host=192.168.1.xx;Port=5432;Database=mydb;...
+
+# Sau: kết nối qua PgBouncer
+Host=192.168.1.pgbouncer;Port=5432;Database=mydb;...
+# (Hoặc IP của server chạy PgBouncer)
+```
+
+---
+
+### So sánh SQL Server vs PostgreSQL trong bài toán scaling
+
+| | SQL Server | PostgreSQL |
+|---|---|---|
+| **Connection model** | Thread-based — 1 connection = 1 thread | Process-based — 1 connection = 1 OS process |
+| **Max connections thực tế** | Vài nghìn connection thoải mái | >200–300 connection bắt đầu tốn RAM/CPU đáng kể |
+| **Connection pooler bắt buộc?** | Không (có thì tốt, nhưng không critical) | **Có** — PgBouncer gần như bắt buộc ở production |
+| **Read replica** | AlwaysOn AG (cần Enterprise/Developer) | Streaming Replication built-in, miễn phí |
+| **Sharding** | Cần giải pháp bên ngoài | Citus extension, partition native |
+| **License** | Trả phí (Developer Edition miễn phí nhưng chỉ dev) | Miễn phí hoàn toàn |
+| **Managed cloud** | Azure SQL, AWS RDS SQL Server | AWS Aurora PostgreSQL, GCP Cloud SQL, Supabase |
+
+**Kết luận thực tế:**
+- Đang dùng **SQL Server**: tune connection pool + thêm Redis cache là đủ cho hầu hết bài toán scale vừa. Read replica khi cần thiết nhưng cần license.
+- Đang dùng **PostgreSQL**: bắt buộc thêm PgBouncer khi >100 concurrent connection. Read replica miễn phí và dễ cấu hình hơn SQL Server.
+
+---
+
+### Thứ tự ưu tiên khi DB quá tải
+
+```
+Bước 1 (30 phút):  Tune Max Pool Size trong connection string
+                   → không tốn tiền, không thay đổi code
+
+Bước 2 (vài giờ): Thêm Redis cache cho GET endpoints
+                   → giảm 70–90% số lần gọi DB đối với read-heavy app
+
+Bước 3 (1–2 ngày): Thêm PgBouncer (PostgreSQL) hoặc tune SQL Server
+                    → giải quyết connection exhaustion
+
+Bước 4 (vài ngày): Thêm Read Replica
+                    → scale read throughput ngang
+
+Bước 5 (phức tạp): Sharding / partitioning
+                    → khi data quá lớn, 1 DB không chứa hết
+```
+
+> **Nguyên tắc:** làm từ đơn giản đến phức tạp. Phần lớn hệ thống vừa dừng ở Bước 2–3. Sharding chỉ cần khi data > vài trăm GB và vẫn không đủ sau khi đã có replica + cache.
+
+---
+
 ## Cấu hình Nginx nâng cao (tùy chọn sau khi lab cơ bản OK)
 
 ### Least connections thay vì round-robin
@@ -961,6 +1345,29 @@ Cũng kiểm tra SQL Server Docker trên VM1 đã map port 1433 ra host:
 docker ps | grep sql
 # Kỳ vọng thấy 0.0.0.0:1433->1433/tcp
 ```
+
+### Container api crash ngay khi start: `BIO routines::system lib`
+
+**Triệu chứng:** Log hiện `Interop+Crypto+OpenSslCryptographicException: error:10080002:BIO routines::system lib` và container liên tục restart.
+
+**Nguyên nhân:** `openssl pkcs12 -export` sinh file `.pfx` với permissions `600` (owner-only). Container chạy bằng `appuser` (uid 1001), không phải user sinh cert → OpenSSL không mở được file.
+
+**Fix:**
+
+```bash
+# Kiểm tra permissions
+ls -la ~/projects/OpenIdDict_MrGold/docker/certs/openiddict.pfx
+# Nếu thấy -rw------- (600) → đây là vấn đề
+
+# Sửa permissions
+chmod 644 ~/projects/OpenIdDict_MrGold/docker/certs/openiddict.pfx
+
+# Xóa container cũ (docker compose up -d không tự restart container đang trong loop)
+docker stop api && docker rm api
+docker compose -f docker-compose.yaml up -d
+```
+
+> `gen-cert.sh` trong repo đã được cập nhật để tự động `chmod 644` sau khi tạo cert. Lỗi này chỉ xảy ra nếu dùng script cũ hoặc tạo cert thủ công.
 
 ### OpenIddict certificate lỗi khi API thứ hai khởi động
 

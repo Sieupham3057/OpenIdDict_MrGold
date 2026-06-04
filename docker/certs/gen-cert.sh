@@ -38,6 +38,9 @@ openssl pkcs12 -export \
 # Xóa file trung gian — chỉ giữ .pfx
 rm -f "${CERT_DIR}/${CERT_NAME}.key" "${CERT_DIR}/${CERT_NAME}.crt"
 
+# Cho phép container user (non-root) đọc file — openssl tạo ra 600 by default
+chmod 644 "${CERT_DIR}/${CERT_NAME}.pfx"
+
 echo ""
 echo "=== Done ==="
 echo "File: ${CERT_DIR}/${CERT_NAME}.pfx"
