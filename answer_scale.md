@@ -72,6 +72,87 @@
 
 ---
 
+## Chuẩn bị — Checkout branch và khởi động từ đầu trên VM1
+
+Branch `technical_leader_scale` có thay đổi bắt buộc so với branch cũ: API **không còn tự fallback về ephemeral key** — nếu không có cert file thì container crash ngay khi start. Vì vậy phải sinh cert **trước** khi `docker compose up`.
+
+### Bước 0.1 — Checkout branch trên VM1
+
+```bash
+cd ~/projects/OpenIdDict_MrGold
+
+git fetch origin
+git checkout technical_leader_scale
+git pull
+```
+
+### Bước 0.2 — Dọn sạch stack cũ
+
+`down -v` dừng tất cả container **và xóa toàn bộ volume** (InfluxDB data, Prometheus data, Grafana dashboards, API logs). Cần làm điều này để tránh conflict config cũ còn sót trong volume.
+
+```bash
+cd ~/projects/OpenIdDict_MrGold/docker
+docker compose -f docker-compose.yaml down -v
+```
+
+Verify sạch:
+
+```bash
+docker ps -a | grep -E "api|influxdb|prometheus|grafana|cadvisor"
+# Kỳ vọng: không còn container nào trong danh sách
+```
+
+### Bước 0.3 — Sinh certificate (bắt buộc, làm 1 lần)
+
+Branch này yêu cầu cert file trước khi `docker compose up`. Nếu bỏ qua bước này, container `api` sẽ crash với lỗi `InvalidOperationException: OpenIddict: Biến môi trường 'OpenIddict__CertPath' chưa được cấu hình`.
+
+```bash
+cd ~/projects/OpenIdDict_MrGold/docker/certs
+chmod +x gen-cert.sh
+./gen-cert.sh
+```
+
+Verify cert đã tồn tại:
+
+```bash
+ls -lh ~/projects/OpenIdDict_MrGold/docker/certs/
+# Kỳ vọng: thấy openiddict.pfx (~4KB)
+```
+
+### Bước 0.4 — Khởi động lại stack
+
+```bash
+cd ~/projects/OpenIdDict_MrGold/docker
+docker compose -f docker-compose.yaml up -d --build
+```
+
+Theo dõi quá trình start (đặc biệt container `api`):
+
+```bash
+docker compose -f docker-compose.yaml logs -f api
+```
+
+Kỳ vọng thấy trong log:
+```
+Application started. Press Ctrl+C to shut down.
+```
+
+Nếu thấy `InvalidOperationException` → cert chưa được mount đúng, kiểm tra lại Bước 0.3.
+
+Verify toàn bộ stack healthy:
+
+```bash
+docker ps --format "table {{.Names}}\t{{.Status}}"
+# Kỳ vọng: api, influxdb, prometheus, grafana, cadvisor đều Up ... (healthy)
+
+curl http://localhost:5000/health
+# Kỳ vọng: {"status":"Healthy"}
+```
+
+> **Lưu ý về `-v`:** Vì volume bị xóa, Grafana mất toàn bộ dashboard đã import. Cần import lại 3 dashboard (ID 2587, 10915, 14282) như hướng dẫn trong answer.md Bước 3.3. Datasource InfluxDB và Prometheus được auto-provision lại từ file — không cần tạo lại.
+
+---
+
 ## Phase 1 — Tìm điểm chết của single server
 
 Mục tiêu: **ghi lại ngưỡng mà API bắt đầu fail khi chỉ có 1 instance**. Số liệu này là baseline để so sánh sau khi scale.
