@@ -1065,13 +1065,179 @@ Vì ~80–90% request thường là READ → replica gánh phần lớn tải �
 
 #### SQL Server — AlwaysOn Availability Group
 
-```
-Yêu cầu: SQL Server Enterprise hoặc Developer Edition
-         (Standard Edition chỉ hỗ trợ Basic AG, 1 database per group)
+##### Cơ chế hoạt động
 
-Kiến trúc tối giản:
-  Primary: 192.168.1.xx  — nhận read + write
-  Secondary: 192.168.1.yy — nhận read-only (readable secondary)
+AlwaysOn AG (Availability Group) là tính năng HA + read scale-out của SQL Server từ phiên bản 2012 trở lên. Cơ chế:
+
+```
+[Primary replica]
+  ├── Nhận mọi WRITE (INSERT/UPDATE/DELETE/DDL)
+  ├── Ghi transaction log
+  └── Gửi log stream → Secondary (đồng bộ hoặc bất đồng bộ)
+
+[Secondary replica]  ← đọc từ log stream của Primary
+  ├── Apply log liên tục (redo thread)
+  ├── Chỉ nhận READ nếu là "readable secondary"
+  └── Có thể failover thành Primary nếu Primary chết
+```
+
+Có 2 chế độ đồng bộ:
+
+| Chế độ | Độ trễ | An toàn dữ liệu | Dùng khi |
+|--------|--------|-----------------|----------|
+| **Synchronous** | Cao hơn (~1–5ms thêm vào mỗi write) | Zero data loss — Primary chờ Secondary xác nhận | Secondary cùng datacenter hoặc LAN nhanh |
+| **Asynchronous** | Thấp | Có thể mất vài giây data nếu Primary crash đột ngột | Secondary ở datacenter xa, WAN |
+
+Với bài lab này (2 VM cùng mạng LAN) → dùng Synchronous.
+
+##### Yêu cầu phiên bản và Edition
+
+| Edition | AlwaysOn AG | Readable Secondary | Số Secondary tối đa | Ghi chú |
+|---------|-------------|-------------------|---------------------|---------|
+| **Enterprise** | ✅ Full AG | ✅ Có thể đọc | 8 (sync) + không giới hạn async | Phiên bản duy nhất hỗ trợ read offloading thật sự |
+| **Standard** | ✅ Basic AG | ❌ Không readable | 1 Secondary, chỉ failover | Không dùng cho read scale-out được |
+| **Developer** | ✅ Giống Enterprise | ✅ Có | 8 | **Miễn phí** nhưng cấm dùng production |
+| **Web** | ❌ | ❌ | — | Chỉ qua hosting provider |
+| **Express** | ❌ | ❌ | — | DB < 10GB, dev nhỏ |
+
+> **Kết luận thực tế:** Để làm read replica đúng nghĩa (secondary nhận READ query) → **bắt buộc Enterprise Edition** (hoặc Developer cho lab/test).
+
+##### Phiên bản SQL Server được hỗ trợ
+
+AlwaysOn AG có từ SQL Server 2012. Các phiên bản còn được Microsoft support tính đến 2026:
+
+| Phiên bản | Mainstream Support | Extended Support | Ghi chú |
+|-----------|-------------------|-----------------|---------|
+| SQL Server 2019 | Hết 2025 | Đến 2030 | Vẫn trong extended support |
+| **SQL Server 2022** | Đến 2028 | Đến 2033 | Phiên bản mới nhất, khuyến nghị |
+| SQL Server 2017 | Đã hết | Đến 2027 | Sắp hết support |
+
+##### Giá license SQL Server 2022 (tính đến 2025)
+
+Microsoft bán license theo 2 mô hình:
+
+**Mô hình 1 — Per Core (phổ biến nhất, recommended):**
+
+Bán theo gói "2-core pack", mỗi server phải mua tối thiểu 4 core (2 gói):
+
+| Edition | Giá / 2-core pack | 1 server 4 core | 1 server 8 core |
+|---------|-------------------|-----------------|-----------------|
+| **Enterprise** | ~$15,123 USD | ~$30,246 | ~$60,492 |
+| **Standard** | ~$1,048 USD | ~$2,096 | ~$4,192 |
+| Developer | $0 | $0 | $0 (dev/test only) |
+
+> Giá trên là retail list price của Microsoft. VAR (reseller) thường discount 10–30%. Giá VND dao động theo tỷ giá và đại lý phân phối tại Việt Nam.
+
+**Mô hình 2 — Server + CAL (chỉ Standard, dành cho nội bộ công ty):**
+- $3,945 / server + $239 / user CAL hoặc $239 / device CAL
+- Không áp dụng nếu user bên ngoài kết nối (web app public)
+
+**License dùng được bao lâu, bao nhiêu máy:**
+- License là **perpetual** (vĩnh viễn, mua một lần dùng mãi)
+- Mỗi license gắn với **1 server cụ thể** — không dùng chung được
+- Muốn chạy trên 2 VM (Primary + Secondary) → phải **mua license cho cả 2 VM**
+- Software Assurance (SA) — gói bảo trì tùy chọn: ~25%/năm của giá license → cho quyền upgrade lên version mới
+
+**Ví dụ chi phí thực tế cho lab 2 VM (4 core/VM):**
+
+```
+Enterprise (đúng yêu cầu readable secondary):
+  VM1 (Primary)  : 2 gói × $15,123 = $30,246
+  VM2 (Secondary): 2 gói × $15,123 = $30,246
+  Tổng:                              $60,492 USD ≈ 1.5 tỷ VND
+
+Standard (chỉ failover, KHÔNG đọc được):
+  VM1 + VM2     : 4 gói × $1,048  = $4,192 USD ≈ 105 triệu VND
+  (nhưng secondary không nhận READ — không giải quyết bài toán scale)
+```
+
+> **Đây là lý do PostgreSQL phổ biến hơn cho startup và lab:** read replica miễn phí hoàn toàn với Streaming Replication built-in.
+
+##### Primary và Secondary phải ở 2 VM khác nhau — tại sao?
+
+Đây là câu hỏi quan trọng. **Primary và Secondary PHẢI cài trên 2 máy/VM riêng biệt.** Nếu chạy trên cùng 1 VM thì hoàn toàn vô nghĩa về mặt giảm tải:
+
+```
+❌ SAI — Primary + Secondary cùng 1 VM:
+
+  [VM1 — 8 core, 16GB RAM]
+    ├── SQL Server Primary instance (:1433)   ← xử lý WRITE
+    └── SQL Server Secondary instance (:1434) ← xử lý READ
+
+  Kết quả: READ query vẫn tiêu thụ CPU/RAM/Disk I/O của cùng 1 máy vật lý
+  → Tổng tải trên VM1 không giảm chút nào
+  → Disk I/O: Primary write WAL log + Secondary apply log = I/O còn cao hơn
+  → Không đạt mục đích scale-out
+```
+
+```
+✅ ĐÚNG — Primary và Secondary ở 2 VM riêng:
+
+  [VM1 — Primary]              [VM2 — Secondary]
+  SQL Server :1433             SQL Server :1433
+  Nhận WRITE từ API       ←─── Nhận log stream từ VM1
+                                Nhận READ từ API
+
+  → WRITE tiêu thụ CPU/RAM/Disk của VM1
+  → READ tiêu thụ CPU/RAM/Disk của VM2
+  → VM1 "nhẹ" hơn vì không phải chạy SELECT nặng
+  → VM2 là "đọc-only server" — không bị ảnh hưởng bởi WRITE lock
+```
+
+**Kiến trúc đầy đủ sau khi có read replica:**
+
+```
+[k6 / Client]
+      │
+      ▼
+[Nginx :80]
+      │
+  ┌───┴───┐
+  ▼       ▼
+[API VM1] [API VM2]   ← stateless, round-robin
+  │           │
+  ├── WRITE ──┤──────────────────────────────────┐
+  │           │                                  ▼
+  └── READ ───┘──────────────────────┐   [SQL Primary — VM_DB1]
+                                     │         │ WAL stream
+                                     ▼         ▼
+                             [SQL Secondary — VM_DB2]  ← READ only
+```
+
+**Cơ chế giảm tải cụ thể:**
+
+Giả sử 1000 request/giây, 80% là READ (SELECT), 20% là WRITE:
+
+```
+Không có replica:
+  SQL Server VM_DB1: xử lý 800 READ + 200 WRITE = 1000 query/s
+  → CPU cao, lock contention giữa read và write
+
+Có replica:
+  SQL Primary VM_DB1: xử lý 200 WRITE/s
+  SQL Secondary VM_DB2: xử lý 800 READ/s
+  → Mỗi server chịu ~1/5 tải ban đầu cho primary, 4/5 cho secondary
+  → Không còn lock contention: write không chặn read
+```
+
+Ngoài giảm tải, secondary còn loại bỏ "read/write lock contention" — vấn đề mà khi bảng đang bị UPDATE thì SELECT phải chờ, gây tăng latency đột biến ở tải cao.
+
+##### Setup AlwaysOn AG tối giản (lab với 2 VM)
+
+> **Yêu cầu:** Cả 2 VM phải join Windows domain hoặc dùng Workgroup AG (SQL Server 2019+). Với lab Linux/Docker thì AG yêu cầu cấu hình phức tạp hơn — đây là lý do PostgreSQL thực tế hơn cho lab.
+
+**Bước tổng quan (Windows Server + SQL Server Enterprise):**
+
+```
+1. Cài Windows Failover Cluster (WSFC) trên cả 2 VM
+2. Cài SQL Server Enterprise trên cả 2 VM
+3. Enable AlwaysOn AG feature trong SQL Server Configuration Manager
+4. Tạo AG trong SSMS:
+   - Chọn databases cần replicate
+   - Thêm secondary replica (VM2)
+   - Chọn Synchronous commit + Readable secondary
+5. Tạo AG Listener (virtual IP/DNS name)
+6. Cập nhật connection string trong API
 ```
 
 Trong connection string .NET để tự động route:
@@ -1084,68 +1250,665 @@ Server=192.168.1.xx,1433;Database=AuthDemoDB;...;ApplicationIntent=ReadWrite
 Server=192.168.1.yy,1433;Database=AuthDemoDB;...;ApplicationIntent=ReadOnly
 ```
 
-Hoặc dùng AG Listener (DNS name tự route):
+Hoặc dùng AG Listener (DNS name tự route — khuyến nghị):
 
 ```
 Server=ag-listener,1433;Database=AuthDemoDB;...;ApplicationIntent=ReadOnly
 # Listener tự biết chuyển ReadOnly → secondary, ReadWrite → primary
 ```
 
+##### Lựa chọn thực tế cho lab/startup Việt Nam
+
+| Tình huống | Khuyến nghị |
+|-----------|-------------|
+| Lab/học tập | SQL Server Developer Edition (miễn phí) hoặc PostgreSQL |
+| Startup, budget thấp | PostgreSQL + Streaming Replication (miễn phí) |
+| Doanh nghiệp, đang dùng SQL Server | Cân nhắc Azure SQL (subscription) thay vì mua Enterprise |
+| Cloud Azure | Azure SQL Geo-Replication / Auto-failover groups — không cần mua license riêng |
+
+> **Trên cloud (Azure SQL Database):** read replica được tính theo DTU/vCore — không cần mua Enterprise license riêng. Đây thường là lựa chọn kinh tế hơn cho production thay vì tự quản lý AlwaysOn AG.
+
+##### Hands-on: Cấu hình AlwaysOn AG trên 2 VM (Docker + Linux)
+
+```
+Lab IPs (riêng biệt với App VMs):
+  VM_DB1: 192.168.1.40  — SQL Server Primary  (nhận WRITE + READ)
+  VM_DB2: 192.168.1.41  — SQL Server Secondary (nhận READ only)
+```
+
+**Bước 1 — docker-compose trên cả 2 VM (chỉ khác hostname)**
+
+```yaml
+# ~/sqlserver-ag/docker-compose.yml
+# VM_DB1: hostname: vm-db1
+# VM_DB2: hostname: vm-db2  ← chỉ đổi dòng này
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: sqlserver
+    hostname: vm-db1
+    ports:
+      - "1433:1433"
+      - "5022:5022"    # HADR mirroring endpoint — bắt buộc
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=YourStrong@Passw0rd
+      - MSSQL_ENABLE_HADR=1    # bật AlwaysOn AG feature
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+    restart: unless-stopped
+volumes:
+  sqlserver-data:
+```
+
+```bash
+# Chạy trên cả 2 VM
+cd ~/sqlserver-ag && docker compose up -d
+sleep 30   # chờ SQL Server khởi động
+
+# Tạo thư mục cert/backup trong container (cả 2 VM)
+docker exec sqlserver mkdir -p /var/opt/mssql/certs /var/opt/mssql/backup
+```
+
+**Bước 2 — T-SQL trên PRIMARY (VM_DB1)**
+
+Kết nối bằng sqlcmd hoặc Azure Data Studio vào `192.168.1.40,1433`:
+
+```sql
+USE master;
+
+-- Tạo master key
+IF NOT EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = '##MS_DatabaseMasterKey##')
+    CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'MasterKey@AG2025!';
+
+-- Tạo certificate để xác thực endpoint
+CREATE CERTIFICATE AG_Cert_Primary
+  WITH SUBJECT = 'HADR Endpoint Auth', EXPIRY_DATE = '2035-12-31';
+
+-- Export cert (sẽ copy sang secondary)
+BACKUP CERTIFICATE AG_Cert_Primary
+  TO FILE = '/var/opt/mssql/certs/ag_cert_primary.cer';
+
+-- Tạo HADR endpoint lắng nghe port 5022
+CREATE ENDPOINT AG_Endpoint
+  STATE = STARTED
+  AS TCP (LISTENER_PORT = 5022)
+  FOR DATABASE_MIRRORING (
+    AUTHENTICATION = CERTIFICATE AG_Cert_Primary,
+    ENCRYPTION = REQUIRED ALGORITHM AES,
+    ROLE = ALL
+  );
+
+-- Database phải ở FULL recovery mode mới vào được AG
+ALTER DATABASE AuthDemoDB SET RECOVERY FULL;
+BACKUP DATABASE AuthDemoDB
+  TO DISK = '/var/opt/mssql/backup/AuthDemoDB.bak' WITH FORMAT, INIT, COMPRESSION;
+BACKUP LOG AuthDemoDB
+  TO DISK = '/var/opt/mssql/backup/AuthDemoDB_log.bak' WITH FORMAT, INIT;
+
+-- Tạo Availability Group (CLUSTER_TYPE = NONE = clusterless, không cần WSFC/Pacemaker)
+-- SEEDING_MODE = AUTOMATIC: SQL Server tự copy database sang secondary, không restore thủ công
+CREATE AVAILABILITY GROUP [AuthDemoAG]
+WITH (
+  CLUSTER_TYPE = NONE,
+  DB_FAILOVER = OFF,
+  REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 0
+)
+FOR DATABASE [AuthDemoDB]
+REPLICA ON N'vm-db1' WITH (
+  ENDPOINT_URL    = N'TCP://192.168.1.40:5022',
+  FAILOVER_MODE   = MANUAL,
+  AVAILABILITY_MODE = SYNCHRONOUS_COMMIT,
+  SEEDING_MODE    = AUTOMATIC,
+  SECONDARY_ROLE (ALLOW_CONNECTIONS = READ_ONLY)
+);
+```
+
+**Bước 3 — T-SQL trên SECONDARY (VM_DB2)**
+
+Kết nối vào `192.168.1.41,1433`:
+
+```sql
+USE master;
+
+IF NOT EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = '##MS_DatabaseMasterKey##')
+    CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'MasterKey@AG2025!';
+
+-- Tạo certificate riêng của secondary
+CREATE CERTIFICATE AG_Cert_Secondary
+  WITH SUBJECT = 'HADR Endpoint Auth Secondary', EXPIRY_DATE = '2035-12-31';
+
+-- Export cert của secondary (để copy sang primary)
+BACKUP CERTIFICATE AG_Cert_Secondary
+  TO FILE = '/var/opt/mssql/certs/ag_cert_secondary.cer';
+
+-- Tạo HADR endpoint
+CREATE ENDPOINT AG_Endpoint
+  STATE = STARTED
+  AS TCP (LISTENER_PORT = 5022)
+  FOR DATABASE_MIRRORING (
+    AUTHENTICATION = CERTIFICATE AG_Cert_Secondary,
+    ENCRYPTION = REQUIRED ALGORITHM AES,
+    ROLE = ALL
+  );
+```
+
+**Bước 4 — Trao đổi certificate giữa 2 VM**
+
+```bash
+# Lấy cert từ container ra host
+# Trên VM_DB1:
+docker cp sqlserver:/var/opt/mssql/certs/ag_cert_primary.cer ~/ag_cert_primary.cer
+# Trên VM_DB2:
+docker cp sqlserver:/var/opt/mssql/certs/ag_cert_secondary.cer ~/ag_cert_secondary.cer
+
+# Cross-copy qua scp
+# Từ VM_DB1 → gửi cert primary sang VM_DB2:
+scp ~/ag_cert_primary.cer bank@192.168.1.41:~/
+# Từ VM_DB2 → gửi cert secondary sang VM_DB1:
+scp ~/ag_cert_secondary.cer bank@192.168.1.40:~/
+
+# Copy cert vào trong container
+# Trên VM_DB1:
+docker cp ~/ag_cert_secondary.cer sqlserver:/var/opt/mssql/certs/
+# Trên VM_DB2:
+docker cp ~/ag_cert_primary.cer sqlserver:/var/opt/mssql/certs/
+```
+
+**Bước 5 — Import cert và grant quyền (cả 2 VM)**
+
+Trên PRIMARY (VM_DB1):
+```sql
+-- Import cert của secondary, tạo login để secondary xác thực vào endpoint của primary
+CREATE CERTIFICATE AG_Cert_Secondary_Pub
+  FROM FILE = '/var/opt/mssql/certs/ag_cert_secondary.cer';
+CREATE LOGIN AG_Login_Secondary WITH PASSWORD = 'AGLogin@2025!';
+CREATE USER AG_User_Secondary FOR LOGIN AG_Login_Secondary;
+GRANT CONNECT ON ENDPOINT::AG_Endpoint TO AG_Login_Secondary;
+
+-- Thêm secondary vào AG definition
+ALTER AVAILABILITY GROUP [AuthDemoAG]
+  ADD REPLICA ON N'vm-db2' WITH (
+    ENDPOINT_URL    = N'TCP://192.168.1.41:5022',
+    FAILOVER_MODE   = MANUAL,
+    AVAILABILITY_MODE = SYNCHRONOUS_COMMIT,
+    SEEDING_MODE    = AUTOMATIC,
+    SECONDARY_ROLE (ALLOW_CONNECTIONS = READ_ONLY)
+  );
+```
+
+Trên SECONDARY (VM_DB2):
+```sql
+-- Import cert của primary, tạo login để primary xác thực vào endpoint của secondary
+CREATE CERTIFICATE AG_Cert_Primary_Pub
+  FROM FILE = '/var/opt/mssql/certs/ag_cert_primary.cer';
+CREATE LOGIN AG_Login_Primary WITH PASSWORD = 'AGLogin@2025!';
+CREATE USER AG_User_Primary FOR LOGIN AG_Login_Primary;
+GRANT CONNECT ON ENDPOINT::AG_Endpoint TO AG_Login_Primary;
+
+-- Join AG và cho phép automatic seeding
+ALTER AVAILABILITY GROUP [AuthDemoAG] JOIN WITH (CLUSTER_TYPE = NONE);
+ALTER AVAILABILITY GROUP [AuthDemoAG] GRANT CREATE ANY DATABASE;
+```
+
+**Bước 6 — Verify**
+
+```sql
+-- Chạy trên Primary — kiểm tra trạng thái replica
+SELECT
+  ar.replica_server_name,
+  ars.role_desc,
+  ars.synchronization_health_desc
+FROM sys.dm_hadr_availability_replica_states ars
+JOIN sys.availability_replicas ar ON ars.replica_id = ar.replica_id;
+-- Kỳ vọng: vm-db1 PRIMARY HEALTHY, vm-db2 SECONDARY HEALTHY
+
+-- Kiểm tra replication lag (nên gần 0 trên LAN)
+SELECT ar.replica_server_name,
+       drs.log_send_queue_size AS unsent_kb,
+       drs.redo_queue_size     AS unapplied_kb
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_replicas ar ON drs.replica_id = ar.replica_id;
+```
+
+```bash
+# Test write vào primary, đọc từ secondary
+sqlcmd -S 192.168.1.40,1433 -U sa -P YourStrong@Passw0rd \
+  -Q "INSERT INTO AuthDemoDB.dbo.ReplicationTest VALUES (NEWID(), 'hello from primary')"
+
+sqlcmd -S 192.168.1.41,1433 -U sa -P YourStrong@Passw0rd \
+  -Q "SELECT * FROM AuthDemoDB.dbo.ReplicationTest"
+# Kỳ vọng: thấy row vừa insert
+
+# Thử write vào secondary → phải fail
+sqlcmd -S 192.168.1.41,1433 -U sa -P YourStrong@Passw0rd \
+  -Q "INSERT INTO AuthDemoDB.dbo.ReplicationTest VALUES (NEWID(), 'should fail')"
+# Kỳ vọng: ERROR - The target database is in a read-only state
+```
+
 #### PostgreSQL — Streaming Replication
 
-PostgreSQL native replication đơn giản hơn SQL Server, không cần license đặc biệt.
+PostgreSQL native replication đơn giản hơn SQL Server nhiều — không cần license, không cần cert exchange.
 
-**Trên Primary server** — cho phép replication:
+```
+Lab IPs:
+  VM_DB1: 192.168.1.40  — PostgreSQL Primary
+  VM_DB2: 192.168.1.41  — PostgreSQL Replica (Read)
+```
+
+##### Hands-on: Cấu hình Streaming Replication trên 2 VM (Docker)
+
+**Bước 1 — Config files trên VM_DB1 (Primary)**
 
 ```bash
-# postgresql.conf
-wal_level = replica
-max_wal_senders = 3
-wal_keep_size = 256MB   # giữ WAL đủ lâu cho replica đồng bộ
+# Trên VM_DB1
+mkdir -p ~/postgres-primary/config
+
+cat > ~/postgres-primary/config/postgresql.conf << 'EOF'
+listen_addresses = '*'
+wal_level = replica       # bắt buộc: ghi WAL đủ để replica đọc
+max_wal_senders = 10      # tối đa 10 replica kết nối đồng thời (mặc định đủ cho lab)
+wal_keep_size = 256MB     # giữ 256MB WAL trên disk phòng replica bị lag
+synchronous_commit = on
+EOF
+
+cat > ~/postgres-primary/config/pg_hba.conf << 'EOF'
+local   all             all                                 trust
+host    all             all             127.0.0.1/32        scram-sha-256
+host    all             all             192.168.1.0/24      scram-sha-256
+# Cho phép replication user kết nối từ bất kỳ VM nào trong subnet
+host    replication     replicator      192.168.1.0/24      scram-sha-256
+EOF
+```
+
+```yaml
+# ~/postgres-primary/docker-compose.yml
+services:
+  postgres:
+    image: postgres:16
+    container_name: postgres-primary
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=pgadmin
+      - POSTGRES_PASSWORD=Admin@Postgres2025
+      - POSTGRES_DB=AuthDemoDB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./config/postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./config/pg_hba.conf:/etc/postgresql/pg_hba.conf
+    command: >
+      postgres
+        -c config_file=/etc/postgresql/postgresql.conf
+        -c hba_file=/etc/postgresql/pg_hba.conf
+    restart: unless-stopped
+volumes:
+  pgdata:
 ```
 
 ```bash
-# pg_hba.conf — cho phép replica user kết nối
-host  replication  replicator  192.168.1.yy/32  md5
+# Khởi động Primary
+cd ~/postgres-primary && docker compose up -d
+
+# Tạo user replication (sau khi container healthy ~10s)
+docker exec postgres-primary psql -U pgadmin -d postgres \
+  -c "CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD 'Replicator@2025';"
+
+# Verify
+docker exec postgres-primary psql -U pgadmin \
+  -c "SELECT usename, replication FROM pg_user WHERE usename = 'replicator';"
+# Kỳ vọng: replicator | t
 ```
 
-**Trên Replica server** — pull data từ primary:
+**Bước 2 — Khởi tạo Replica bằng pg_basebackup (VM_DB2)**
+
+`pg_basebackup` sao chép toàn bộ data từ Primary. Flag `-R` tự tạo file `standby.signal` và `postgresql.auto.conf` — PostgreSQL dựa vào đó để biết khởi động ở chế độ standby.
 
 ```bash
-# Lấy base backup từ primary
-pg_basebackup -h 192.168.1.xx -U replicator -D /var/lib/postgresql/data -P -Xs -R
-# -R tự tạo file standby.signal và postgresql.auto.conf
+# Trên VM_DB2 — tạo thư mục data (để TRỐNG, không docker compose up trước)
+mkdir -p ~/postgres-replica/data
+
+# Dùng image postgres tạm thời để chạy pg_basebackup
+docker run --rm \
+  -e PGPASSWORD='Replicator@2025' \
+  -v ~/postgres-replica/data:/var/lib/postgresql/data \
+  postgres:16 \
+  pg_basebackup \
+    -h 192.168.1.40 \
+    -p 5432 \
+    -U replicator \
+    -D /var/lib/postgresql/data \
+    -Xs -P -R
+# -Xs : stream WAL trong lúc backup (không mất transaction nào)
+# -P  : hiện progress bar
+# -R  : tạo standby.signal + postgresql.auto.conf tự động
+
+# Fix permissions: postgres container chạy bằng uid 999 (debian-based image)
+sudo chown -R 999:999 ~/postgres-replica/data
+```
+
+**Bước 3 — Khởi động Replica (VM_DB2)**
+
+```yaml
+# ~/postgres-replica/docker-compose.yml
+# Không cần POSTGRES_USER/DB vì data đã copy từ primary — container chỉ cần chạy postgres
+services:
+  postgres:
+    image: postgres:16
+    container_name: postgres-replica
+    ports:
+      - "5432:5432"
+    environment:
+      - PGDATA=/var/lib/postgresql/data
+      - POSTGRES_PASSWORD=Admin@Postgres2025   # chỉ cho healthcheck nếu cần
+    volumes:
+      - ~/postgres-replica/data:/var/lib/postgresql/data
+    restart: unless-stopped
+    # Container tự detect file standby.signal → tự chạy ở standby/read-only mode
 ```
 
 ```bash
-# postgresql.auto.conf (tự sinh bởi -R)
-primary_conninfo = 'host=192.168.1.xx port=5432 user=replicator password=...'
+cd ~/postgres-replica && docker compose up -d
+
+# Verify replica đang streaming
+docker exec postgres-replica psql -U pgadmin -d AuthDemoDB \
+  -c "SELECT status, sender_host, received_lsn FROM pg_stat_wal_receiver;"
+# Kỳ vọng: status = streaming, sender_host = 192.168.1.40
 ```
 
-Replica sẽ ở chế độ read-only tự động — mọi SELECT đều chạy được, INSERT/UPDATE sẽ báo lỗi.
+**Bước 4 — Verify từ Primary**
 
-**Trong .NET — dùng Npgsql với read/write routing:**
+```bash
+# Xem replica đang kết nối
+docker exec postgres-primary psql -U pgadmin \
+  -c "SELECT client_addr, state, write_lag, replay_lag FROM pg_stat_replication;"
+# Kỳ vọng: client_addr=192.168.1.41, state=streaming, lag=gần 0
 
-```csharp
-// Cài package
-// dotnet add package Npgsql.EntityFrameworkCore.PostgreSQL
+# Test: write primary → đọc được trên replica
+docker exec postgres-primary psql -U pgadmin -d AuthDemoDB \
+  -c "CREATE TABLE IF NOT EXISTS repl_test (id SERIAL, msg TEXT);
+      INSERT INTO repl_test(msg) VALUES ('hello replica');"
 
-// Cấu hình 2 connection string
-builder.Services.AddDbContext<AppDbContext>(options =>
-    options.UseNpgsql(builder.Configuration.GetConnectionString("Primary")));
+docker exec postgres-replica psql -U pgadmin -d AuthDemoDB \
+  -c "SELECT * FROM repl_test;"
+# Kỳ vọng: thấy row 'hello replica'
 
-// DbContext thứ 2 cho read-only operations
-builder.Services.AddDbContext<ReadOnlyDbContext>(options =>
-    options.UseNpgsql(builder.Configuration.GetConnectionString("Replica")));
+# Thử WRITE vào replica → phải fail
+docker exec postgres-replica psql -U pgadmin -d AuthDemoDB \
+  -c "INSERT INTO repl_test(msg) VALUES ('should fail');"
+# Kỳ vọng: ERROR: cannot execute INSERT in a read-only transaction
 ```
 
+---
+
+#### Scale out: 1 Primary + N Replica (3 VM trở lên)
+
+##### PostgreSQL — Fan-out vs Cascade
+
+**Cách 1 — Fan-out (tất cả replica kéo từ Primary):**
+
 ```
-# appsettings.json
+Primary (VM_DB1: .40)
+  ├── WAL stream ──→ Replica1 (VM_DB2: .41)
+  └── WAL stream ──→ Replica2 (VM_DB3: .42)
+```
+
+Để thêm Replica2: lặp lại **nguyên xi** Bước 2–4 trên VM_DB3 (192.168.1.42). Không cần thay đổi gì trên Primary hay Replica1. `pg_hba.conf` đã dùng subnet `/24` nên tự động cho phép.
+
+**Cách 2 — Cascade (Replica kéo từ Replica, giảm tải Primary):**
+
+```
+Primary (VM_DB1)
+  └── WAL stream ──→ Replica1 (VM_DB2)
+                        └── WAL stream ──→ Replica2 (VM_DB3)
+```
+
+Phù hợp khi có nhiều replica (5+) và không muốn Primary gửi WAL đến tất cả.
+
+Cấu hình Replica1 làm "relay" — thêm vào `postgresql.conf` của Replica1:
+```
+wal_level = replica     # Replica1 cũng cần ghi WAL để Replica2 đọc
+max_wal_senders = 5     # Cho phép downstream replica kết nối
+```
+
+Replica2 chạy `pg_basebackup` trỏ vào Replica1 thay vì Primary:
+```bash
+docker run --rm \
+  -e PGPASSWORD='Replicator@2025' \
+  -v ~/postgres-replica2/data:/var/lib/postgresql/data \
+  postgres:16 \
+  pg_basebackup -h 192.168.1.41 ...   # ← trỏ vào Replica1
+```
+
+| | Fan-out | Cascade |
+|--|---------|---------|
+| Độ phức tạp | Đơn giản, lặp lại setup | Phức tạp hơn |
+| Tải Primary | Tăng theo số replica | Cố định (chỉ 1 WAL sender) |
+| Lag Replica2 | Nhỏ (stream thẳng từ Primary) | Lớn hơn (qua Replica1) |
+| Khi Replica1 chết | Replica2 không ảnh hưởng | Replica2 mất replication |
+| Dùng khi | Lab, ≤5 replica | Nhiều replica, Primary bị tải |
+
+**Giới hạn thực tế:**
+- `max_wal_senders` trên Primary = số replica kết nối đồng thời (mặc định 10, tăng thoải mái)
+- Thực tế: >20 replica trực tiếp thì Primary tốn I/O gửi WAL → dùng cascade
+
+##### SQL Server AG — Thêm replica thứ 3 trở đi
+
+Khi đã có AG (2 VM), thêm replica mới chỉ cần:
+
+1. Cài SQL Server trên VM_DB3 với `MSSQL_ENABLE_HADR=1` và port 5022 (giống VM_DB2)
+2. Tạo cert + endpoint trên VM_DB3 (y chang bước 3 ở trên, đổi tên `vm-db3`)
+3. Trao đổi cert giữa Primary và VM_DB3
+4. Chạy T-SQL thêm replica:
+
+```sql
+-- Trên Primary — sau khi đã import cert VM_DB3 và tạo login/grant
+ALTER AVAILABILITY GROUP [AuthDemoAG]
+  ADD REPLICA ON N'vm-db3' WITH (
+    ENDPOINT_URL      = N'TCP://192.168.1.42:5022',
+    FAILOVER_MODE     = MANUAL,
+    AVAILABILITY_MODE = ASYNCHRONOUS_COMMIT,  -- replica thứ 2+ thường dùng async
+    SEEDING_MODE      = AUTOMATIC,
+    SECONDARY_ROLE (ALLOW_CONNECTIONS = READ_ONLY)
+  );
+```
+
+```sql
+-- Trên VM_DB3
+ALTER AVAILABILITY GROUP [AuthDemoAG] JOIN WITH (CLUSTER_TYPE = NONE);
+ALTER AVAILABILITY GROUP [AuthDemoAG] GRANT CREATE ANY DATABASE;
+```
+
+> Với Enterprise: tối đa **8 synchronous** + không giới hạn **asynchronous** secondary. Replica thứ 2 thường đặt `ASYNCHRONOUS_COMMIT` để không làm chậm write trên Primary.
+
+---
+
+#### Xử lý multiple read replica trong .NET code
+
+##### Cấp 1 — Không cần đổi code: built-in load balancing
+
+Đây là cách tốt nhất — infrastructure tự routing, thêm replica không sửa code.
+
+**SQL Server — AG Listener:**
+
+AG Listener là virtual IP/DNS tự động phân phối `ApplicationIntent=ReadOnly` đến các readable secondary. Khi thêm replica mới, không đổi connection string.
+
+```sql
+-- Tạo AG Listener (T-SQL trên Primary)
+ALTER AVAILABILITY GROUP [AuthDemoAG]
+  ADD LISTENER N'ag-listener' (
+    WITH IP ((N'192.168.1.45', N'255.255.255.0')),
+    PORT = 1433
+  );
+```
+
+```json
+// appsettings.json
 "ConnectionStrings": {
-  "Primary": "Host=192.168.1.xx;Database=mydb;Username=app;Password=...;",
-  "Replica": "Host=192.168.1.yy;Database=mydb;Username=app;Password=...;Target Session Attributes=read-only;"
+  "Write": "Server=ag-listener,1433;Database=AuthDemoDB;...;ApplicationIntent=ReadWrite",
+  "Read":  "Server=ag-listener,1433;Database=AuthDemoDB;...;ApplicationIntent=ReadOnly"
 }
 ```
+
+> AG Listener với clusterless AG cần virtual IP được route đúng trên switch/VMware. Trong lab không có WSFC, dùng thẳng IP của secondary hoặc khai báo tất cả IP trong connection string.
+
+**PostgreSQL — Npgsql multi-host (đơn giản nhất, không cần AG Listener):**
+
+Npgsql hỗ trợ liệt kê nhiều host, tự random-pick standby mỗi lần tạo connection mới.
+
+```json
+"ConnectionStrings": {
+  "Write": "Host=192.168.1.40;Port=5432;Database=AuthDemoDB;Username=app;Password=...;",
+  "Read":  "Host=192.168.1.41,192.168.1.42;Port=5432;Database=AuthDemoDB;Username=app;Password=...;Target Session Attributes=prefer-standby;Load Balance Hosts=true"
+}
+```
+
+- `Target Session Attributes=prefer-standby`: ưu tiên kết nối standby, nếu tất cả standby down thì fallback về primary
+- `Load Balance Hosts=true`: random chọn host trong danh sách mỗi lần connect
+- Thêm Replica3: chỉ cần thêm `192.168.1.43` vào string — không đổi code
+
+---
+
+##### Cấp 2 — 2 DbContext (Write + Read)
+
+Pattern đơn giản nhất khi chỉ cần tách write/read, không cần round-robin tự viết:
+
+```csharp
+// Program.cs
+builder.Services.AddDbContext<AppDbContext>(opt =>
+    opt.UseSqlServer(builder.Configuration.GetConnectionString("Write")));
+
+builder.Services.AddDbContext<ReadDbContext>(opt =>
+    opt.UseSqlServer(builder.Configuration.GetConnectionString("Read"))
+       .UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking));
+```
+
+```csharp
+// ReadDbContext.cs — kế thừa AppDbContext, không cần override gì thêm
+public class ReadDbContext : AppDbContext
+{
+    public ReadDbContext(DbContextOptions<ReadDbContext> options) : base(options) { }
+}
+```
+
+```csharp
+public class UserService
+{
+    private readonly AppDbContext _write;
+    private readonly ReadDbContext _read;
+
+    public async Task<UserInfo?> GetUserInfoAsync(string userId)
+        => await _read.Users
+                      .AsNoTracking()
+                      .Where(u => u.Id == userId)
+                      .Select(u => new UserInfo(u.Id, u.Email))
+                      .FirstOrDefaultAsync();
+
+    public async Task UpdateEmailAsync(string userId, string email)
+    {
+        var user = await _write.Users.FindAsync(userId);
+        user!.Email = email;
+        await _write.SaveChangesAsync();
+    }
+}
+```
+
+---
+
+##### Cấp 3 — Round-robin N replica (khi không có AG Listener, nhiều replica)
+
+Khi không có AG Listener mà có nhiều replica cần phân tải đều:
+
+```csharp
+// ReplicaRouter.cs — singleton, round-robin thread-safe
+public sealed class ReplicaRouter
+{
+    private readonly IReadOnlyList<string> _replicas;
+    private int _counter = -1;
+
+    public ReplicaRouter(IConfiguration config)
+    {
+        _replicas = config.GetSection("DB:ReadReplicas").Get<string[]>()
+                    ?? throw new InvalidOperationException("DB:ReadReplicas not configured");
+    }
+
+    public string Next()
+    {
+        // Unsigned modulo tránh âm khi counter overflow
+        var i = (uint)Interlocked.Increment(ref _counter) % (uint)_replicas.Count;
+        return _replicas[(int)i];
+    }
+}
+```
+
+```csharp
+// ReadDbContextFactory.cs — tạo DbContext trỏ đến replica được chọn
+public sealed class ReadDbContextFactory
+{
+    private readonly ReplicaRouter _router;
+
+    public ReadDbContextFactory(ReplicaRouter router) => _router = router;
+
+    public AppDbContext Create()
+    {
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlServer(_router.Next())
+            .UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking)
+            .Options;
+        return new AppDbContext(options);
+    }
+}
+```
+
+```csharp
+// Program.cs
+builder.Services.AddSingleton<ReplicaRouter>();        // singleton: counter dùng chung toàn app
+builder.Services.AddTransient<ReadDbContextFactory>();  // transient: tạo mới mỗi request
+```
+
+```json
+// appsettings.json
+"DB": {
+  "Write": "Server=192.168.1.40,1433;Database=AuthDemoDB;User Id=app;Password=...;",
+  "ReadReplicas": [
+    "Server=192.168.1.41,1433;Database=AuthDemoDB;User Id=app;Password=...;ApplicationIntent=ReadOnly",
+    "Server=192.168.1.42,1433;Database=AuthDemoDB;User Id=app;Password=...;ApplicationIntent=ReadOnly"
+  ]
+}
+```
+
+Dùng trong service:
+```csharp
+public class UserService
+{
+    private readonly ReadDbContextFactory _readFactory;
+    private readonly AppDbContext _write;
+
+    public async Task<List<UserInfo>> GetUsersAsync()
+    {
+        // Mỗi lần gọi lấy 1 replica theo round-robin
+        await using var ctx = _readFactory.Create();
+        return await ctx.Users
+                        .AsNoTracking()
+                        .Select(u => new UserInfo(u.Id, u.Email))
+                        .ToListAsync();
+    }
+}
+```
+
+---
+
+##### Tóm tắt: chọn pattern nào?
+
+| Scenario | Giải pháp | Ghi chú |
+|----------|-----------|---------|
+| SQL Server + AG Listener | `ApplicationIntent=ReadOnly` trong conn string | Không đổi code khi thêm replica |
+| PostgreSQL | Npgsql multi-host + `Load Balance Hosts=true` | Không đổi code, chỉ thêm IP vào config |
+| Không có Listener, 1 replica | 2 DbContext (Write + Read) | Đơn giản nhất |
+| Không có Listener, N replica | `ReplicaRouter` + `ReadDbContextFactory` | Round-robin tự viết |
+| Production phức tạp | ProxySQL (MySQL/MSSQL) / PgPool-II (PG) | Infrastructure routing, code chỉ biết 1 host |
+
+> **Nguyên tắc:** code chỉ cần biết 2 connection string (Write vs Read). Khi thêm replica, chỉ đổi config — không sửa code.
 
 ---
 
