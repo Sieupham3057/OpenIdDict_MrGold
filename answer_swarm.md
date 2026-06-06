@@ -174,14 +174,268 @@ sudo netplan apply
 ip a   # verify IP mới
 ```
 
-**Bước KA.2 — Cài Nginx + Keepalived trên CẢ 2 VM (.37 và .43)**
+**Bước KA.2 — Cài Docker + Nginx + Keepalived trên CẢ 2 VM (.37 và .43)**
+
+Cả 2 VM phải chạy cùng một Nginx container để khi VIP chuyển sang Backup, nó xử lý được request giống hệt Master.
+
+**Bước KA.2.1 — Cài Docker (chạy trên CẢ 2 VM)**
 
 ```bash
-# Trên 192.168.1.37 và 192.168.1.43
+# Chạy lần lượt trên 192.168.1.37 VÀ 192.168.1.43
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+newgrp docker
+docker --version   # Kỳ vọng: Docker version 24.x hoặc cao hơn
+```
+
+**Bước KA.2.2 — Tạo cấu hình Nginx (chạy trên CẢ 2 VM)**
+
+```bash
+# Chạy trên 192.168.1.37 VÀ 192.168.1.43 — cùng cấu hình giống nhau
+mkdir -p ~/nginx-lb
+```
+
+```bash
+cat > ~/nginx-lb/nginx.conf << 'EOF'
+# ════════════════════════════════════════════════════════════════════
+# PHẦN 1 — WORKER (bắt buộc)
+# ════════════════════════════════════════════════════════════════════
+
+# Số process Nginx chạy song song để xử lý request.
+# "auto" = tự detect số CPU core của VM.
+# VM 1 CPU → 1 worker, VM 4 CPU → 4 worker.
+worker_processes auto;
+
+events {
+    # [BẮT BUỘC] Mỗi worker xử lý tối đa bao nhiêu connection cùng lúc.
+    # Tổng concurrent connections = worker_processes × worker_connections.
+    # 1024 là đủ cho lab; production thường dùng 4096–65536.
+    worker_connections 1024;
+
+    # [TÙY CHỌN] Dùng epoll — model xử lý I/O hiệu quả nhất trên Linux.
+    # Nginx trên Linux mặc định đã dùng epoll, ghi ra cho rõ ý định.
+    use epoll;
+
+    # [TÙY CHỌN] Cho phép 1 worker nhận nhiều connection trong 1 lần xử lý.
+    # Tăng throughput khi có nhiều request đến cùng lúc.
+    multi_accept on;
+}
+
+# ════════════════════════════════════════════════════════════════════
+# PHẦN 2 — HTTP BLOCK (bắt buộc, bọc toàn bộ cấu hình web)
+# ════════════════════════════════════════════════════════════════════
+http {
+
+    # [BẮT BUỘC] Cho Nginx biết đuôi file nào là loại content gì.
+    # Ví dụ: .jpg → image/jpeg, .js → application/javascript.
+    # Thiếu dòng này Nginx không biết trả Content-Type đúng cho browser.
+    include       /etc/nginx/mime.types;
+
+    # [BẮT BUỘC] Loại content mặc định khi không khớp mime.types nào.
+    default_type  application/octet-stream;
+
+    # [TÙY CHỌN] OS copy file thẳng từ kernel → socket, không qua user space.
+    # Tăng tốc đáng kể khi serve file tĩnh (HTML, JS, ảnh...).
+    # Với reverse proxy thuần thì lợi ích ít hơn nhưng vẫn nên bật.
+    sendfile on;
+
+    # [TÙY CHỌN] Gom nhiều packet nhỏ thành 1 packet lớn trước khi gửi.
+    # Giảm số lần gọi send() → giảm overhead TCP header.
+    tcp_nopush on;
+
+    # [TÙY CHỌN] Gửi data ngay lập tức, không chờ gom packet (tắt Nagle algorithm).
+    # Kết hợp tcp_nopush + tcp_nodelay: throughput tốt mà latency cũng thấp.
+    tcp_nodelay on;
+
+    # [TÙY CHỌN] Giữ connection HTTP keep-alive tối đa 65 giây.
+    # Tránh phải mở TCP connection mới cho mỗi request của cùng 1 client.
+    keepalive_timeout 65;
+
+    # [TÙY CHỌN — nên bật] Ẩn version Nginx trong response header.
+    # Mặc định Nginx trả: "Server: nginx/1.25.3" → hacker biết version để exploit.
+    # Sau khi bật: chỉ trả "Server: nginx".
+    server_tokens off;
+
+    # ──────────────────────────────────────────────────────────────
+    # LOGGING — ghi log request để debug và theo dõi load balancing
+    # ──────────────────────────────────────────────────────────────
+
+    # [TÙY CHỌN nhưng rất hữu ích] Định nghĩa format của dòng log.
+    # Các biến quan trọng:
+    #   $remote_addr      = IP của client gọi vào Nginx
+    #   $time_local       = thời gian request
+    #   $request          = "GET /api/users HTTP/1.1"
+    #   $status           = HTTP status code trả về (200, 404, 500...)
+    #   $upstream_addr    = IP của Swarm node nào thực sự xử lý request
+    #                       → dùng để xem Nginx có phân phối đều không
+    #   $request_time     = tổng thời gian từ lúc nhận request đến lúc trả response
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" upstream="$upstream_addr" rt=$request_time';
+
+    # Ghi access log (mỗi request) theo format "main" vừa định nghĩa.
+    access_log /var/log/nginx/access.log main;
+
+    # Ghi error log, chỉ ghi từ mức "warn" trở lên (warn/error/crit/alert/emerg).
+    error_log  /var/log/nginx/error.log warn;
+
+    # ──────────────────────────────────────────────────────────────
+    # UPSTREAM — danh sách backend server (BẮT BUỘC, phần cốt lõi)
+    # ──────────────────────────────────────────────────────────────
+
+    # Khai báo nhóm backend tên "app_backend".
+    # Nginx sẽ phân phối request đến các server trong nhóm này.
+    # Mặc định dùng round-robin: req1→.40, req2→.41, req3→.42, req4→.40...
+    upstream app_backend {
+        # 3 Swarm node — Nginx gửi đến port 80 của mỗi node.
+        # Docker Swarm ingress tự routing đến đúng container bên trong.
+        # weight=1: cả 3 ngang nhau, mỗi cái nhận 1/3 tổng request.
+        # Nếu .40 mạnh hơn: đặt weight=2 → .40 nhận 2/4, .41 và .42 mỗi cái 1/4.
+        server 192.168.1.40:80 weight=1;
+        server 192.168.1.41:80 weight=1;
+        server 192.168.1.42:80 weight=1;
+
+        # [TÙY CHỌN] Giữ sẵn tối đa 32 connection TCP đến mỗi backend.
+        # Tránh tốn thời gian TCP handshake mỗi lần có request mới.
+        # Phải dùng kết hợp với proxy_http_version 1.1 bên dưới mới có tác dụng.
+        keepalive 32;
+    }
+
+    # ──────────────────────────────────────────────────────────────
+    # SERVER BLOCK PORT 80 — nhận request HTTP từ client (BẮT BUỘC)
+    # ──────────────────────────────────────────────────────────────
+    server {
+        # Lắng nghe port 80 (HTTP chuẩn).
+        listen 80;
+
+        # Nhận request từ bất kỳ hostname hoặc IP nào.
+        # Dù client gọi vào 192.168.1.37 hay 192.168.1.36 (VIP) đều nhận.
+        server_name _;
+
+        # [BẮT BUỘC khi dùng keepalive upstream] Dùng HTTP/1.1 để giao tiếp với backend.
+        # HTTP/1.0 không hỗ trợ keep-alive → keepalive 32 ở trên vô tác dụng nếu thiếu dòng này.
+        proxy_http_version 1.1;
+
+        # [BẮT BUỘC khi dùng keepalive upstream] Xóa header "Connection: close" của HTTP/1.0.
+        # Nếu không xóa, backend sẽ đóng connection sau mỗi request → keepalive không hoạt động.
+        proxy_set_header Connection "";
+
+        # Gửi hostname gốc lên backend (backend có thể cần để phân biệt virtual host).
+        proxy_set_header Host              $host;
+
+        # Gửi IP thật của client lên backend.
+        # Không có dòng này → backend chỉ thấy IP của Nginx (.37), không biết client thật là ai.
+        # Quan trọng cho: logging, rate limiting, geo-blocking trong ứng dụng.
+        proxy_set_header X-Real-IP         $remote_addr;
+
+        # Chuỗi proxy chain: nếu đã qua nhiều proxy thì thêm IP vào cuối chuỗi.
+        # Ví dụ: "client_ip, proxy1_ip, nginx_ip".
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+
+        # Cho backend biết client dùng http hay https để redirect đúng.
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # [BẮT BUỘC] Chuyển toàn bộ request (mọi path bắt đầu bằng /) sang upstream.
+        location / {
+            proxy_pass http://app_backend;
+        }
+
+        # [TÙY CHỌN — cần cho Keepalived] Endpoint để Keepalived kiểm tra Nginx còn sống không.
+        # Keepalived chạy script: curl http://localhost/nginx-health
+        # Nếu trả về 200 → Nginx OK, giữ VIP.
+        # Nếu không trả về → Nginx chết, chuyển VIP sang Backup.
+        location /nginx-health {
+            access_log off;              # không ghi log cho health check, tránh spam log
+            return 200 "healthy\n";      # trả về 200 OK với body "healthy"
+            add_header Content-Type text/plain;
+        }
+    }
+
+    # ──────────────────────────────────────────────────────────────
+    # SERVER BLOCK PORT 8080 — xem thống kê nội bộ (TÙY CHỌN)
+    # Dùng để: debug thủ công + Prometheus scrape metric
+    # Có thể bỏ toàn bộ block này nếu không cần monitoring
+    # ──────────────────────────────────────────────────────────────
+    server {
+        listen 8080;
+
+        # Trang thống kê built-in của Nginx (stub_status module).
+        # Truy cập: curl http://192.168.1.37:8080/nginx-status
+        # Kết quả trả về:
+        #   Active connections: 5
+        #   server accepts handled requests: 100 100 200
+        #   Reading: 0 Writing: 1 Waiting: 4
+        # Chỉ cho phép IP trong mạng lab (.0/24) xem, chặn IP ngoài.
+        location /nginx-status {
+            stub_status on;
+            access_log off;
+            allow 192.168.1.0/24;   # chỉ VM trong lab mới xem được
+            deny all;               # chặn tất cả IP khác
+        }
+
+        # Health check endpoint cho port 8080 — Prometheus exporter dùng để verify Nginx up.
+        location /nginx-health {
+            access_log off;
+            return 200 "ok\n";
+            add_header Content-Type text/plain;
+        }
+    }
+}
+EOF
+```
+
+```bash
+cat > ~/nginx-lb/docker-compose.yml << 'EOF'
+services:
+  nginx:
+    # Image Nginx bản Alpine — nhỏ gọn (~40MB), đủ dùng cho reverse proxy.
+    image: nginx:1.25-alpine
+    # Đặt tên cố định cho container. Keepalived dùng tên này để check:
+    #   docker inspect --format='{{.State.Running}}' nginx-lb
+    container_name: nginx-lb
+    ports:
+      - "80:80"       # HTTP: ánh xạ port 80 VM → port 80 container
+      - "8080:8080"   # Status/health: kiểm tra nội bộ và Prometheus scrape
+    volumes:
+      # Mount file nginx.conf từ VM vào container, :ro = read-only.
+      # Khi sửa nginx.conf trên VM → reload không downtime:
+      #   docker exec nginx-lb nginx -s reload
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      # Lưu log ra volume riêng để không mất khi restart container.
+      - nginx-logs:/var/log/nginx
+    # Tự restart nếu crash, trừ khi bị stop thủ công (docker stop).
+    restart: unless-stopped
+    healthcheck:
+      # Docker tự kiểm tra Nginx còn sống không.
+      # wget gọi /nginx-health; trả 200 = healthy, không trả = fail.
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/nginx-health"]
+      interval: 10s   # kiểm tra mỗi 10 giây
+      timeout: 5s     # không trả lời trong 5s = fail 1 lần
+      retries: 3      # fail 3 lần liên tiếp → container = unhealthy
+
+volumes:
+  # Volume tên nginx-logs — Docker tự tạo và quản lý, dữ liệu tồn tại độc lập.
+  nginx-logs:
+EOF
+```
+
+```bash
+# Khởi động Nginx
+cd ~/nginx-lb
+docker compose up -d
+
+# Verify Nginx đang chạy
+docker ps
+curl http://localhost:8080/nginx-health   # Kỳ vọng: ok
+```
+
+**Bước KA.2.3 — Cài Keepalived (chạy trên CẢ 2 VM)**
+
+```bash
+# Trên 192.168.1.37 VÀ 192.168.1.43
 sudo apt update
 sudo apt install -y keepalived
-
-# Docker và Nginx đã có (hoặc cài như Bước 1.1 ở trên)
+keepalived --version   # Kỳ vọng: Keepalived v2.x
 ```
 
 **Bước KA.3 — Cấu hình Keepalived trên Master (192.168.1.37)**
@@ -239,38 +493,41 @@ sudo nano /etc/keepalived/keepalived.conf
 ```
 
 ```
-# /etc/keepalived/keepalived.conf — BACKUP
-# Giống hệt Master, chỉ khác 2 dòng
+# /etc/keepalived/keepalived.conf — BACKUP (192.168.1.43)
+# Nội dung gần giống Master (.37), CHỈ KHÁC 2 dòng: state và priority.
 
+# Script kiểm tra Nginx container còn chạy không — giống hệt Master.
 vrrp_script check_nginx {
     script "docker inspect --format='{{.State.Running}}' nginx-lb | grep -q true"
-    interval 2
-    weight -30
-    fall 2
-    rise 2
+    interval 2     # kiểm tra mỗi 2 giây
+    weight -30     # nếu nginx chết → priority giảm 30 (90-30=60) → thua Master (100) luôn
+    fall 2         # fail 2 lần liên tiếp mới tính là down
+    rise 2         # pass 2 lần liên tiếp mới tính là up lại
 }
 
 vrrp_instance VI_NGINX {
-    state BACKUP             # ← khác: BACKUP
-    interface ens33
-    virtual_router_id 51
-    priority 90              # ← khác: thấp hơn Master
-    advert_int 1
-    preempt_delay 10
+    state BACKUP             # ← KHÁC Master: khởi động ở trạng thái BACKUP (chờ)
+    interface ens33          # tên network interface — kiểm tra bằng: ip a
+    virtual_router_id 51     # PHẢI giống Master (51) — để 2 node nhận ra nhau là 1 nhóm VRRP
+    priority 90              # ← KHÁC Master: thấp hơn (90 < 100) → Master thắng khi cả 2 sống
+    advert_int 1             # gửi heartbeat mỗi 1 giây để phát hiện Master còn sống không
+    preempt_delay 10         # sau khi Master recover, chờ 10s rồi mới trả VIP về Master
+                             # tránh VIP nhảy liên tục khi Master vừa khởi động
 
     authentication {
         auth_type PASS
-        auth_pass Lab@VRRP2025
+        auth_pass Lab@VRRP2025   # PHẢI giống Master — để 2 node xác thực nhau qua mạng
     }
 
     virtual_ipaddress {
-        192.168.1.36/24 dev ens33
+        192.168.1.36/24 dev ens33   # VIP sẽ được gán vào đây khi Master chết
     }
 
     track_script {
-        check_nginx
+        check_nginx   # nếu nginx-lb container chết → priority tụt → không tranh VIP với Master
     }
 
+    # Ghi trạng thái ra file để debug dễ: cat /tmp/keepalived-state
     notify_master "/bin/bash -c 'echo MASTER > /tmp/keepalived-state'"
     notify_backup "/bin/bash -c 'echo BACKUP > /tmp/keepalived-state'"
 }
@@ -1009,39 +1266,50 @@ mkdir -p ~/sqlserver-ag
 cat > ~/sqlserver-ag/docker-compose.yml << 'EOF'
 services:
   sqlserver:
+    # Image SQL Server 2022 Developer Edition — miễn phí, đủ tính năng AG cho lab.
+    # KHÔNG dùng cho production vì vi phạm license Microsoft.
     image: mcr.microsoft.com/mssql/server:2022-latest
     container_name: sqlserver
+    # hostname quan trọng: SQL Server AlwaysOn dùng hostname để nhận diện node trong cluster.
+    # Primary khai báo replica ON N'vm-db1' → phải khớp với hostname này.
     hostname: vm-db1
     ports:
-      - "1433:1433"
-      - "5022:5022"    # HADR mirroring endpoint — PHẢI mở, AG dùng cổng này
+      - "1433:1433"   # Port SQL Server chuẩn — client và API kết nối vào đây
+      - "5022:5022"   # HADR mirroring endpoint — PHẢI mở, Primary và Secondary trao đổi
+                      # transaction log qua port này. Không mở = AG không hoạt động.
     environment:
-      - ACCEPT_EULA=Y
-      - MSSQL_SA_PASSWORD=YourStrong@Passw0rd
-      - MSSQL_ENABLE_HADR=1    # Bật tính năng AlwaysOn AG
-      - MSSQL_AGENT_ENABLED=true
+      - ACCEPT_EULA=Y                           # Bắt buộc: đồng ý license Microsoft
+      - MSSQL_SA_PASSWORD=YourStrong@Passw0rd   # Password tài khoản sa (System Administrator)
+                                                # Phải đủ mạnh: chữ hoa, chữ thường, số, ký tự đặc biệt
+      - MSSQL_ENABLE_HADR=1                     # Bật tính năng Always On High Availability
+                                                # Mặc định tắt; = 1 để AG hoạt động
+      - MSSQL_AGENT_ENABLED=true                # Bật SQL Server Agent — cần cho một số tác vụ AG
     volumes:
-      - sqlserver-data:/var/opt/mssql
-      - sqlserver-certs:/var/opt/mssql/certs
-      - sqlserver-backup:/var/opt/mssql/backup
+      - sqlserver-data:/var/opt/mssql           # Data, log DB, config SQL Server — QUAN TRỌNG nhất
+                                                # Mất volume này = mất toàn bộ database
+      - sqlserver-certs:/var/opt/mssql/certs    # Lưu certificate dùng để xác thực giữa Primary và Secondary
+      - sqlserver-backup:/var/opt/mssql/backup  # Lưu file backup .bak — AG yêu cầu ít nhất 1 full backup
     restart: unless-stopped
     healthcheck:
+      # Chạy lệnh sqlcmd thực tế để kiểm tra SQL Server đã ready chưa.
+      # SELECT 1 = query đơn giản nhất, nếu chạy được = SQL Server đang sống.
+      # -C = trust server certificate (bỏ qua SSL verify trong môi trường lab)
       test: /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "YourStrong@Passw0rd" -C -Q "SELECT 1" > /dev/null 2>&1
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
+      interval: 15s      # kiểm tra mỗi 15 giây
+      timeout: 10s       # chờ tối đa 10s mỗi lần
+      retries: 10        # thử 10 lần — SQL Server khởi động chậm, cần nhiều lần
+      start_period: 60s  # chờ 60s trước khi bắt đầu healthcheck (SQL Server cần ~30-60s để init)
 
 volumes:
-  sqlserver-data:
-  sqlserver-certs:
-  sqlserver-backup:
+  sqlserver-data:    # lưu database files
+  sqlserver-certs:   # lưu certificates cho AG authentication
+  sqlserver-backup:  # lưu file backup
 EOF
 
 docker compose up -d
 ```
 
-**Trên VM_DB2 (192.168.1.39) — CHỈ đổi hostname:**
+**Trên VM_DB2 (192.168.1.39) — CHỈ đổi hostname, tất cả còn lại giống hệt:**
 
 ```bash
 mkdir -p ~/sqlserver-ag
@@ -1050,7 +1318,9 @@ services:
   sqlserver:
     image: mcr.microsoft.com/mssql/server:2022-latest
     container_name: sqlserver
-    hostname: vm-db2              # ← DUY NHẤT khác so với VM_DB1
+    # ← CHỈ DÒNG NÀY KHÁC: vm-db2 thay vì vm-db1
+    # Primary sẽ khai báo: ADD REPLICA ON N'vm-db2' → phải khớp hostname này
+    hostname: vm-db2
     ports:
       - "1433:1433"
       - "5022:5022"
@@ -1411,39 +1681,80 @@ cd ~/postgres-primary
 
 ```bash
 cat > ~/postgres-primary/config/postgresql.conf << 'EOF'
-# Cài đặt replication
-listen_addresses = '*'              # lắng nghe mọi interface
-wal_level = replica                 # PHẢI đặt: ghi WAL đủ để replica đọc được
-                                    # minimal = không đủ, logical = cho logical replication
-max_wal_senders = 10               # tối đa 10 replica kết nối đồng thời
-wal_keep_size = 256MB              # giữ 256MB WAL trên disk
-                                    # phòng replica bị lag, không tự fetch được
-synchronous_commit = on            # đảm bảo durability: chờ WAL flush disk trước khi commit
-hot_standby = on                   # cho phép replica nhận READ query trong khi apply WAL
+# ═══════════════════════════════════════════════════════════
+# postgresql.conf — cấu hình PostgreSQL Primary
+# File này override cấu hình mặc định bên trong container
+# ═══════════════════════════════════════════════════════════
 
-# Performance
-shared_buffers = 256MB             # cache trong RAM (~25% RAM)
+# [BẮT BUỘC cho replication] Lắng nghe trên tất cả network interface.
+# Mặc định PostgreSQL chỉ lắng nghe localhost → replica không kết nối được.
+listen_addresses = '*'
+
+# [BẮT BUỘC cho replication] Mức độ chi tiết ghi vào WAL (Write-Ahead Log).
+# minimal  = chỉ đủ để crash recovery — replica KHÔNG đọc được
+# replica  = ghi đủ để replica streaming — DÙNG CÁI NÀY
+# logical  = ghi thêm cho logical replication — nhiều hơn cần thiết
+wal_level = replica
+
+# Tối đa bao nhiêu replica được kết nối đồng thời để nhận WAL.
+# 10 là đủ dư cho lab; production thường 3-5.
+max_wal_senders = 10
+
+# Giữ lại 256MB WAL file trên disk của Primary.
+# Nếu replica bị lag quá nhiều (network down, restart...) mà WAL đã bị xóa
+# → replica phải pg_basebackup lại từ đầu. Giữ đủ để replica tự catch up.
+wal_keep_size = 256MB
+
+# Primary chờ WAL được flush vào disk TRƯỚC khi báo commit thành công.
+# on  = đảm bảo không mất data (zero data loss) — thêm ~1-2ms latency mỗi write
+# off = nhanh hơn nhưng có thể mất vài transaction khi crash
+synchronous_commit = on
+
+# [BẮT BUỘC] Cho phép replica nhận READ query trong khi đang apply WAL.
+# Thiếu dòng này → replica chỉ có thể dùng làm failover, không phục vụ READ được.
+hot_standby = on
+
+# ─── Performance ──────────────────────────────────────────
+# Cache data trong RAM. Quy tắc: ~25% tổng RAM của VM.
+# VM 1GB RAM → 256MB, VM 4GB RAM → 1GB.
+shared_buffers = 256MB
+
+# Gợi ý cho query planner biết tổng cache OS + shared_buffers có thể dùng.
+# Không thực sự cấp phát RAM, chỉ ảnh hưởng query plan.
 effective_cache_size = 1GB
+
+# Tối đa bao nhiêu client kết nối đồng thời (app + replica + admin).
 max_connections = 200
 EOF
 ```
 
 ```bash
 cat > ~/postgres-primary/config/pg_hba.conf << 'EOF'
-# pg_hba.conf — ai được kết nối vào PostgreSQL
-# TYPE  DATABASE    USER        ADDRESS             METHOD
+# ═══════════════════════════════════════════════════════════
+# pg_hba.conf — Host-Based Authentication
+# Kiểm soát AI được phép kết nối vào PostgreSQL từ ĐÂU và bằng CÁCH NÀO.
+# Các dòng được đọc từ trên xuống, khớp dòng đầu tiên là dùng luôn.
+# ═══════════════════════════════════════════════════════════
+# Cú pháp: TYPE  DATABASE  USER  ADDRESS  METHOD
+#
+# TYPE:     local (unix socket), host (TCP/IP), hostssl (chỉ SSL)
+# DATABASE: tên database, "all" = tất cả
+# USER:     tên user, "all" = tất cả
+# ADDRESS:  IP hoặc subnet (chỉ dùng với host/hostssl)
+# METHOD:   trust (không cần pass), scram-sha-256 (cần pass), reject (chặn)
 
-# Local (socket)
+# Kết nối qua unix socket (từ trong container) — dùng trust (không cần pass)
 local   all         all                             trust
 
-# Localhost IPv4
+# Kết nối từ localhost qua TCP/IP — yêu cầu xác thực password
 host    all         all         127.0.0.1/32        scram-sha-256
 
-# Toàn bộ subnet — app server kết nối
+# Toàn bộ subnet 192.168.1.0/24 — cho phép API server kết nối vào
 host    all         all         192.168.1.0/24      scram-sha-256
 
-# Replication connections — chỉ user 'replicator' với replication privilege
-# Subnet /24 cho phép bất kỳ VM nào trong lab làm replica
+# Chỉ user 'replicator' được kết nối với mục đích replication.
+# Phải tạo user này với quyền REPLICATION (bước tiếp theo).
+# Subnet /24 cho phép bất kỳ VM nào trong lab làm replica.
 host    replication replicator  192.168.1.0/24      scram-sha-256
 EOF
 ```
@@ -1452,33 +1763,40 @@ EOF
 # ~/postgres-primary/docker-compose.yml
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16              # PostgreSQL 16 — bản LTS mới nhất
     container_name: postgres-primary
-    hostname: pg-primary
+    hostname: pg-primary            # hostname để replica nhận diện trong log
     ports:
-      - "5432:5432"
+      - "5432:5432"                 # port PostgreSQL chuẩn
     environment:
-      - POSTGRES_USER=pgadmin
+      - POSTGRES_USER=pgadmin       # tạo superuser tên pgadmin khi init lần đầu
       - POSTGRES_PASSWORD=Admin@Postgres2025
-      - POSTGRES_DB=AuthDemoDB
-      - PGDATA=/var/lib/postgresql/data
+      - POSTGRES_DB=AuthDemoDB      # tạo database AuthDemoDB khi init lần đầu
+      - PGDATA=/var/lib/postgresql/data  # thư mục lưu data trong container
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Mount 2 file config từ VM vào container thay thế config mặc định.
+      # Nếu không mount, PostgreSQL dùng config mặc định bên trong image
+      # (không có replication, chỉ lắng nghe localhost).
       - ./config/postgresql.conf:/etc/postgresql/postgresql.conf
       - ./config/pg_hba.conf:/etc/postgresql/pg_hba.conf
+    # Override lệnh start để chỉ định đường dẫn đến file config.
+    # Không có dòng này, PostgreSQL không biết dùng file config nào.
     command: >
       postgres
         -c config_file=/etc/postgresql/postgresql.conf
         -c hba_file=/etc/postgresql/pg_hba.conf
     restart: unless-stopped
     healthcheck:
+      # pg_isready: tool có sẵn trong image, kiểm tra PostgreSQL đã accept connection chưa.
+      # Nhanh và nhẹ hơn chạy query thực.
       test: ["CMD", "pg_isready", "-U", "pgadmin", "-d", "AuthDemoDB"]
       interval: 10s
       timeout: 5s
       retries: 5
 
 volumes:
-  pgdata:
+  pgdata:   # lưu toàn bộ data PostgreSQL — quan trọng nhất, không được xóa
 ```
 
 ```bash
@@ -1541,21 +1859,29 @@ sudo chown -R 999:999 ~/postgres-replica/data
 
 ```yaml
 # ~/postgres-replica/docker-compose.yml
-# Không cần khai báo POSTGRES_USER/DB — data đã copy từ Primary, không cần init
+# ⚠ QUAN TRỌNG: Không khai báo POSTGRES_USER/DB ở đây.
+# Lý do: data đã được copy đầy đủ từ Primary qua pg_basebackup (bước trên).
+# Nếu khai báo POSTGRES_USER/DB, Docker sẽ cố gắng init lại database → xung đột với data có sẵn.
 services:
   postgres:
     image: postgres:16
     container_name: postgres-replica
     hostname: pg-replica
     ports:
-      - "5432:5432"
+      - "5432:5432"   # cùng port với Primary — client dùng IP khác nhau để phân biệt
     environment:
       - PGDATA=/var/lib/postgresql/data
-      - POSTGRES_PASSWORD=Admin@Postgres2025   # chỉ cần cho healthcheck
+      # POSTGRES_PASSWORD ở đây chỉ để healthcheck tool pg_isready chạy được,
+      # KHÔNG phải để tạo user mới. Password thật đã có trong data copy từ Primary.
+      - POSTGRES_PASSWORD=Admin@Postgres2025
     volumes:
+      # Mount thư mục data đã copy từ Primary (bước pg_basebackup).
+      # Trong data này đã có file standby.signal → PostgreSQL tự chạy ở chế độ standby
+      # (read-only + liên tục apply WAL từ Primary).
       - ./data:/var/lib/postgresql/data
     restart: unless-stopped
     healthcheck:
+      # pg_isready kiểm tra Replica đã accept connection chưa.
       test: ["CMD", "pg_isready", "-U", "pgadmin", "-d", "AuthDemoDB"]
       interval: 10s
       timeout: 5s
@@ -1867,75 +2193,95 @@ Tạo file `docker-stack.yml` (trên Manager — **không** có `build:`, Swarm 
 
 ```yaml
 # ~/stacks/docker-stack.yml
-# Lưu ý: Docker Stack KHÔNG hỗ trợ build: — phải dùng image từ registry
+# ⚠ Docker Stack KHÔNG hỗ trợ "build:" — chỉ dùng image đã build sẵn từ registry.
+# Lý do: worker node không có source code, chỉ pull image từ registry về chạy.
 version: "3.8"
 
 services:
 
   api:
-    image: 192.168.1.50:5000/authdemo-api:latest   # image từ private registry
+    # Image lấy từ private registry (192.168.1.50) — không qua internet.
+    # Format: <registry-host>:<port>/<image-name>:<tag>
+    image: 192.168.1.50:5000/authdemo-api:latest
     ports:
-      - "5000:8080"   # Swarm ingress: port 5000 trên mọi node → container :8080
-    environment:
-      - ASPNETCORE_ENVIRONMENT=Production
-      # Connection string KHÔNG chứa password — lấy từ secret
-      - ConnectionStrings__DefaultConnection=Server=192.168.1.38,1433;Database=AuthDemoDB;User Id=sa;TrustServerCertificate=True;
+      # Swarm ingress routing: port 5000 trên TẤT CẢ node (.40, .41, .42) đều
+      # forward vào container :8080. Client gọi vào bất kỳ node nào cũng được.
+      - "5000:8080"
     secrets:
-      - db-password           # mount tại /run/secrets/db-password
-      - openiddict-cert       # mount tại /run/secrets/openiddict-cert
-      - cert-password         # mount tại /run/secrets/cert-password
+      # Khai báo secrets sẽ được mount vào container tại /run/secrets/<tên>.
+      # Container đọc từ file, không qua env var → an toàn hơn.
+      - db-password           # → /run/secrets/db-password
+      - openiddict-cert       # → /run/secrets/openiddict-cert  (file .pfx)
+      - cert-password         # → /run/secrets/cert-password
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
+      # Connection string KHÔNG có password — password lấy từ secret file.
+      - ConnectionStrings__DefaultConnection=Server=192.168.1.38,1433;Database=AuthDemoDB;User Id=sa;TrustServerCertificate=True;
       - DB_SERVER=192.168.1.38,1433
       - DB_NAME=AuthDemoDB
       - DB_USER=sa
-      # Secret file paths — app đọc từ đây thay vì env var
+      # App đọc các biến *_FILE này để biết đường dẫn đến secret file.
       - DB_PASSWORD_FILE=/run/secrets/db-password
       - OpenIddict__CertPath=/run/secrets/openiddict-cert
       - OpenIddict__CertPasswordFile=/run/secrets/cert-password
     networks:
-      - app-network
+      - app-network   # tham gia overlay network để giao tiếp container-to-container
     deploy:
+      # replicated = chạy đúng số lượng bản sao cố định.
+      # Đối lập với global (1 container trên mỗi node, không kể số node).
       mode: replicated
-      replicas: 3              # 1 replica trên mỗi node (3 node = 3 container)
+      replicas: 3   # 3 container — 1 trên mỗi worker node (.41, .42 + 1 node nữa)
       placement:
         constraints:
-          - node.role == worker   # chỉ deploy trên worker, không deploy trên manager
+          # Chỉ deploy trên worker, không deploy trên Manager (.40).
+          # Manager chuyên điều phối — không nên chạy workload để tránh ảnh hưởng Raft.
+          - node.role == worker
       update_config:
-        parallelism: 1         # rolling update: 1 container tại 1 thời điểm
-        delay: 10s             # chờ 10s giữa mỗi container update
-        failure_action: rollback  # nếu update fail → tự rollback
-        monitor: 30s           # monitor 30s sau khi update để detect failure
-        order: start-first     # start container mới TRƯỚC khi kill container cũ (zero downtime)
+        parallelism: 1    # Rolling update: chỉ update 1 container tại 1 thời điểm.
+                          # parallelism: 2 = update 2 cùng lúc (nhanh hơn, rủi ro hơn).
+        delay: 10s        # Chờ 10s sau mỗi container update trước khi update cái tiếp theo.
+                          # Thời gian để container mới warm up và healthcheck pass.
+        failure_action: rollback  # Nếu update fail → tự động rollback toàn bộ về version cũ.
+        monitor: 30s      # Sau khi update, theo dõi 30s để phát hiện failure muộn.
+        order: start-first  # Start container MỚI trước, rồi mới kill container CŨ.
+                            # → Zero downtime: lúc nào cũng có container phục vụ request.
       rollback_config:
-        parallelism: 1
-        delay: 5s
+        parallelism: 1   # rollback 1 container tại 1 thời điểm
+        delay: 5s        # chờ 5s giữa mỗi container rollback
       restart_policy:
-        condition: on-failure
-        delay: 5s
-        max_attempts: 3
-        window: 120s
+        condition: on-failure   # chỉ restart khi container exit với code != 0 (lỗi)
+                                # không restart nếu stop thủ công
+        delay: 5s               # chờ 5s trước khi restart (tránh restart loop quá nhanh)
+        max_attempts: 3         # thử tối đa 3 lần; nếu vẫn fail → Swarm đánh dấu failed
+        window: 120s            # reset đếm max_attempts sau 120s nếu container đang healthy
       resources:
         limits:
-          cpus: '1.0'
-          memory: 512M
+          cpus: '1.0'     # container này dùng tối đa 1 CPU core
+          memory: 512M    # tối đa 512MB RAM — nếu vượt, container bị kill (OOMKilled)
         reservations:
-          cpus: '0.25'
-          memory: 256M
+          cpus: '0.25'    # Swarm đảm bảo node có ít nhất 0.25 CPU core trống trước khi đặt container
+          memory: 256M    # đảm bảo node có ít nhất 256MB RAM trống
     healthcheck:
+      # Swarm dùng healthcheck để biết container có thực sự ready xử lý request chưa.
+      # Container start xong nhưng app chưa kịp init → Swarm chờ healthy mới route traffic vào.
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
+      interval: 15s      # kiểm tra mỗi 15s
+      timeout: 5s        # không trả lời trong 5s = fail
+      retries: 3         # fail 3 lần liên tiếp → unhealthy → Swarm restart container
+      start_period: 30s  # chờ 30s sau khi start trước khi bắt đầu healthcheck
+                         # (.NET app cần thời gian khởi động — tránh fail ngay từ đầu)
 
 networks:
   app-network:
-    external: true   # dùng overlay network đã tạo sẵn (bước 3.4)
+    # external: true = network này đã tạo sẵn bằng "docker network create" (bước 3.4).
+    # Không để Swarm tự tạo — tự tạo sẽ đặt tên khác (authdemo_app-network).
+    external: true
 
 secrets:
+  # external: true = secret đã tạo sẵn bằng "docker secret create" (bước 3.5).
+  # Swarm không tự tạo secret — phải tạo trước khi deploy stack.
   db-password:
-    external: true   # secret đã tạo bằng docker secret create (bước 3.5)
+    external: true
   openiddict-cert:
     external: true
   cert-password:
@@ -2057,18 +2403,26 @@ mkdir -p ~/registry
 cat > ~/registry/docker-compose.yml << 'EOF'
 services:
   registry:
+    # Image registry:2 — Docker Distribution Registry, phiên bản chính thức.
+    # Minimal, không có UI, không có auth — chỉ dùng cho lab nội bộ tin tưởng.
     image: registry:2
     container_name: registry
     ports:
+      # Port 5000 là port mặc định của Docker Registry.
+      # Khi push: docker push 192.168.1.50:5000/myimage:tag
       - "5000:5000"
     environment:
+      # Thư mục lưu tất cả image layers bên trong container.
+      # Được mount ra volume bên dưới để dữ liệu không mất khi restart.
       REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
     volumes:
+      # Toàn bộ image data được lưu tại đây.
+      # Xóa volume này = mất hết tất cả image đã push lên.
       - registry-data:/var/lib/registry
     restart: unless-stopped
 
 volumes:
-  registry-data:
+  registry-data:   # volume lưu image layers — giữ nguyên kể cả khi container restart
 EOF
 
 cd ~/registry
@@ -2218,24 +2572,35 @@ cat ~/registry/auth/htpasswd
 #### Bước REG.2.3 — Cập nhật docker-compose với TLS + Auth
 
 ```yaml
-# ~/registry/docker-compose.yml
+# ~/registry/docker-compose.yml — Cấp 2: có TLS + Basic Auth
 services:
   registry:
     image: registry:2
     container_name: registry
     ports:
-      - "443:5000"    # HTTPS trên port 443
+      # Đổi từ 5000 → 443 để client dùng HTTPS chuẩn.
+      # docker push 192.168.1.50/myimage (không cần port vì 443 là mặc định HTTPS)
+      - "443:5000"
     environment:
+      # Đường dẫn đến cert và key TLS bên trong container.
+      # Registry tự bật HTTPS khi 2 biến này được set.
       REGISTRY_HTTP_TLS_CERTIFICATE: /certs/registry.crt
-      REGISTRY_HTTP_TLS_KEY: /certs/registry.key
+      REGISTRY_HTTP_TLS_KEY:         /certs/registry.key
+
+      # Loại authentication: htpasswd (file username:bcrypt-hash).
       REGISTRY_AUTH: htpasswd
+      # Tên realm hiển thị khi client bị hỏi username/password (chuỗi tùy ý).
       REGISTRY_AUTH_HTPASSWD_REALM: "Registry Realm"
+      # Đường dẫn đến file htpasswd trong container.
       REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
-      REGISTRY_STORAGE_DELETE_ENABLED: "true"   # cho phép xóa image
+
+      # Cho phép xóa image qua API (DELETE /v2/<name>/manifests/<digest>).
+      # Mặc định false — bật để có thể dọn dẹp image cũ.
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
     volumes:
       - registry-data:/var/lib/registry
-      - ./certs:/certs:ro
-      - ./auth:/auth:ro
+      - ./certs:/certs:ro   # cert và key TLS — read-only
+      - ./auth:/auth:ro     # file htpasswd chứa username/password — read-only
     restart: unless-stopped
 
 volumes:
