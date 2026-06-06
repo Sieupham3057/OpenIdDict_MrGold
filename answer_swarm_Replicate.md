@@ -114,6 +114,53 @@
 
 ---
 
+### Frontend gọi URL nào?
+
+**Quy tắc:** Frontend **luôn gọi vào Nginx**, không bao giờ gọi thẳng vào Swarm node. Swarm node là implementation detail — có thể scale up/down bất cứ lúc nào.
+
+| Trường hợp | URL frontend gọi | Ghi chú |
+|---|---|---|
+| Lab đơn giản (chỉ Nginx) | `http://192.168.1.37` | Gọi thẳng Nginx Master |
+| Lab có Keepalived HA | `http://192.168.1.36` | **Khuyến nghị** — VIP không đổi dù Master chết |
+| Có SSL (self-signed) | `https://192.168.1.36` | Client cần trust CA trước |
+| Có domain + Let's Encrypt | `https://api.lab.local` | Domain trỏ về VIP hoặc IP Nginx |
+
+**Trong Angular — đặt vào `environment.ts`:**
+
+```typescript
+// src/environments/environment.ts  (dev/lab)
+export const environment = {
+  production: false,
+  apiUrl: 'http://192.168.1.36'   // ← VIP, không phải IP Swarm node
+};
+
+// src/environments/environment.prod.ts  (production)
+export const environment = {
+  production: true,
+  apiUrl: 'https://api.yourdomain.com'
+};
+```
+
+**Luồng thực tế khi frontend gọi API:**
+
+```
+Angular app (browser)
+    │  fetch('http://192.168.1.36/api/users')
+    ▼
+192.168.1.36 — VIP (Keepalived giữ IP này trên Nginx Master hoặc Backup)
+    │
+    ▼
+192.168.1.37 — Nginx (hoặc .43 nếu Master chết)
+    │  proxy_pass → upstream app_backend (round-robin / least_conn)
+    ▼
+┌───┬───┬───┐
+.40 .41 .42   ← Swarm nodes (frontend không biết, không cần biết)
+```
+
+> **Không bao giờ hardcode IP Swarm node** (`192.168.1.40`, `.41`, `.42`) trong frontend — những IP này có thể tăng/giảm khi scale.
+
+---
+
 ## Part 1 — Nginx Load Balancer (192.168.1.37)
 
 ### Tại sao cần Nginx Load Balancer?
@@ -675,7 +722,19 @@ Tab Advanced: (nếu cần custom Nginx config)
     add_header X-Custom-Header "lab";
 ```
 
-**Load balancing qua NPM** — dùng tab Advanced để thêm upstream:
+**Load balancing qua NPM** — kết hợp Tab Details + Tab Advanced:
+
+**Bước 1 — Tab Details:** Điền thông tin proxy host như bình thường, nhưng ở ô `Forward Hostname / IP` thay vì nhập IP thật, nhập **tên upstream** bạn sẽ định nghĩa ở bước sau:
+
+```
+Tab Details:
+  Domain Names:           api.lab.local
+  Scheme:                 http
+  Forward Hostname / IP:  swarm_nodes   ← đặt TÊN upstream, không phải IP
+  Forward Port:           5000
+```
+
+**Bước 2 — Tab Advanced:** Dán định nghĩa upstream vào ô "Custom Nginx Configuration":
 
 ```nginx
 # Dán vào ô "Custom Nginx Configuration" trong tab Advanced
@@ -688,7 +747,79 @@ upstream swarm_nodes {
 }
 ```
 
-Sau đó đặt Forward Hostname = `swarm_nodes` (tên upstream vừa định nghĩa).
+**Tại sao làm vậy?** NPM dùng giá trị "Forward Hostname / IP" để tạo ra dòng `proxy_pass` trong Nginx config nội bộ. Khi bạn đặt hostname = `swarm_nodes`, NPM tạo ra:
+
+```nginx
+proxy_pass http://swarm_nodes:5000;
+```
+
+Nginx thấy `swarm_nodes` → tìm upstream block cùng tên bạn đã định nghĩa ở Tab Advanced → phân phối request đến cả 3 server `.40`, `.41`, `.42` theo thuật toán `least_conn`. Nếu để hostname là IP thật (`192.168.1.40`) thì Nginx chỉ proxy đến 1 server duy nhất, không có load balancing.
+
+---
+
+**Ví dụ cụ thể: Frontend Angular gọi `http://api.lab.local/api/users`**
+
+**Bước 0 — `api.lab.local` là gì?**
+
+`api.lab.local` là tên domain bạn **tự đặt** cho lab, không tồn tại thật trên internet. Để browser/Angular biết tên này trỏ vào đâu, bạn cần thêm vào file hosts trên **máy chạy frontend** (máy Windows của bạn):
+
+```
+# C:\Windows\System32\drivers\etc\hosts  (mở bằng Notepad - Run as Administrator)
+192.168.1.37    api.lab.local
+```
+
+> Thay `192.168.1.37` bằng `192.168.1.36` nếu đã setup Keepalived VIP.
+
+**Bước 1 — Angular gọi API:**
+
+```typescript
+// src/environments/environment.ts
+export const environment = {
+  production: false,
+  apiUrl: 'http://api.lab.local'   // ← tên domain vừa đặt trong hosts
+};
+```
+
+```typescript
+// Khi gọi API trong service
+this.http.get(`${environment.apiUrl}/api/users`)
+// → thực tế gửi request: GET http://api.lab.local/api/users
+```
+
+**Bước 2 — Toàn bộ luồng request:**
+
+```
+[Browser Angular]
+    │  GET http://api.lab.local/api/users
+    │
+    ▼  (1) Browser tra hosts file → api.lab.local = 192.168.1.37
+    │
+    ▼  (2) Request đến 192.168.1.37:80 — đây là NPM
+    │
+    ▼  (3) NPM nhận, thấy Host: api.lab.local → khớp proxy host đã tạo
+    │      NPM's nginx chạy: proxy_pass http://swarm_nodes:5000
+    │
+    ▼  (4) upstream swarm_nodes → least_conn → chọn 192.168.1.41:5000
+    │
+    ▼  (5) Request đến 192.168.1.41:5000 — Docker Swarm ingress
+    │      Swarm tự routing vào container đang chạy API
+    │
+    ▼  (6) Container xử lý /api/users → trả về JSON
+    │
+    ▼  (7) Response đi ngược lại: Container → Swarm → NPM → Browser
+
+Lần sau (request tiếp theo):
+  → NPM có thể chọn .40 hoặc .42 — frontend không biết, không quan tâm
+```
+
+**Tóm lại `api.lab.local` là gì:**
+
+| | |
+|---|---|
+| Không phải | Domain thật trên internet |
+| Là | Tên tự đặt trong `hosts` file, trỏ về IP của NPM/Nginx |
+| Dùng để | Frontend gọi 1 địa chỉ cố định, không cần biết bên trong có mấy server |
+| Thay thế bằng | `192.168.1.37` trực tiếp nếu không muốn đặt domain |
 
 ---
 
@@ -1380,11 +1511,23 @@ sudo ufw allow 1433/tcp
 sudo ufw allow 5022/tcp
 sudo ufw reload
 
-# Test kết nối chéo
-# Từ VM_DB1 test sang VM_DB2:
+# Verify UFW đã mở
+sudo ufw status
+```
+
+> **Lưu ý quan trọng:** Chưa test `nc` ở bước này được — port 5022 do **SQL Server tạo qua T-SQL** (`CREATE ENDPOINT`), không tự động mở khi container start.
+> - `Connection refused` = UFW đã mở nhưng **chưa có process nào listen** → bình thường ở bước này
+> - `Connection timed out` = UFW đang block → mới cần xem lại firewall
+>
+> Test `nc` sau khi hoàn thành **DB.SQL.3 Block 5** và **DB.SQL.4 Block 2** (đã tạo HADR Endpoint trên cả 2 node).
+
+```bash
+# ⚠ Chạy SAU khi đã tạo HADR Endpoint ở DB.SQL.3 và DB.SQL.4
+# Test kết nối chéo — từ VM_DB1 test sang VM_DB2:
 nc -zv 192.168.1.39 5022
 # Từ VM_DB2 test sang VM_DB1:
 nc -zv 192.168.1.38 5022
+# Expected: Connection to ... port [tcp/*] succeeded!
 ```
 
 #### Bước DB.SQL.3 — Tạo database và cấu hình Primary (VM_DB1)
@@ -1408,6 +1551,12 @@ ALTER DATABASE AuthDemoDB SET RECOVERY FULL;
 GO
 ```
 
+> **Trước khi chạy Block 2:** Nếu gặp lỗi `Access is denied` trên `/var/opt/mssql/backup`, cần cấp quyền cho `mssql` user trước — chạy trên terminal VM_DB1:
+> ```bash
+> docker exec -u root sqlserver chown -R mssql:mssql /var/opt/mssql/backup
+> ```
+> **Lý do:** Volume được Docker tạo thuộc `root`, SQL Server process chạy với user `mssql` (UID 10001) không có quyền ghi.
+
 ```sql
 -- ========== BLOCK 2: Backup (AG yêu cầu ít nhất 1 full backup) ==========
 BACKUP DATABASE AuthDemoDB
@@ -1430,6 +1579,11 @@ IF NOT EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = '##MS_DatabaseMaste
     CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'MasterKey@AG2025!';
 GO
 ```
+
+> **Trước khi chạy Block 4:** Nếu gặp lỗi `Cannot write into file '/var/opt/mssql/certs/...'`, cần cấp quyền cho thư mục `certs` — chạy trên terminal **cả 2 VM**:
+> ```bash
+> docker exec -u root sqlserver chown -R mssql:mssql /var/opt/mssql/certs
+> ```
 
 ```sql
 -- ========== BLOCK 4: Tạo certificate để xác thực giữa 2 node ==========
@@ -1536,14 +1690,26 @@ scp ~/ag_cert_secondary.cer bank@192.168.1.38:~/
 
 # ── TRÊN VM_DB1: Copy cert secondary vào container ──
 docker cp ~/ag_cert_secondary.cer sqlserver:/var/opt/mssql/certs/
+# ⚠ docker cp để file thuộc root → mssql user không đọc được → chown ngay sau khi copy
+docker exec -u root sqlserver chown mssql:mssql /var/opt/mssql/certs/ag_cert_secondary.cer
 
 # ── TRÊN VM_DB2: Copy cert primary vào container ──
 docker cp ~/ag_cert_primary.cer sqlserver:/var/opt/mssql/certs/
+docker exec -u root sqlserver chown mssql:mssql /var/opt/mssql/certs/ag_cert_primary.cer
 ```
 
 #### Bước DB.SQL.6 — Import cert và grant quyền
 
 **Trên PRIMARY (VM_DB1):**
+
+> **Nếu chạy lại block này sau khi đã chạy thất bại một phần**, một số object có thể đã tồn tại. Chạy cleanup trước:
+> ```sql
+> -- Cleanup nếu cần chạy lại (bỏ qua nếu lần đầu)
+> IF EXISTS (SELECT 1 FROM sys.certificates WHERE name = 'AG_Cert_Secondary_Pub')
+>     DROP CERTIFICATE AG_Cert_Secondary_Pub;
+> ```
+> Login/User đã tồn tại (`Msg 15025/15023`) → bỏ qua, không cần drop.
+> Replica đã tồn tại (`Msg 35282`) → bỏ qua lệnh `ALTER AVAILABILITY GROUP ... ADD REPLICA`.
 
 ```sql
 -- Import cert của Secondary để Primary trust Secondary
@@ -1627,18 +1793,24 @@ docker exec -it sqlserver /opt/mssql-tools18/bin/sqlcmd \
   -Q "CREATE TABLE AuthDemoDB.dbo.ReplicationTest (id UNIQUEIDENTIFIER DEFAULT NEWID(), msg NVARCHAR(100));
       INSERT INTO AuthDemoDB.dbo.ReplicationTest(msg) VALUES ('hello from primary');"
 
-# Đọc từ Secondary (kết quả nên có ngay trong vài ms)
+# Đọc từ Secondary — PHẢI thêm -K ReadOnly (ApplicationIntent=ReadOnly)
+# AG cấu hình ALLOW_CONNECTIONS = READ_ONLY → kết nối không khai báo ReadOnly bị từ chối Msg 978
 docker exec -it sqlserver /opt/mssql-tools18/bin/sqlcmd \
-  -S 192.168.1.39 -U sa -P "YourStrong@Passw0rd" -C \
+  -S 192.168.1.39 -U sa -P "YourStrong@Passw0rd" -C -K ReadOnly \
   -Q "SELECT * FROM AuthDemoDB.dbo.ReplicationTest"
 # Kỳ vọng: thấy row 'hello from primary'
 
 # Write vào Secondary → PHẢI fail
 docker exec -it sqlserver /opt/mssql-tools18/bin/sqlcmd \
-  -S 192.168.1.39 -U sa -P "YourStrong@Passw0rd" -C \
+  -S 192.168.1.39 -U sa -P "YourStrong@Passw0rd" -C -K ReadOnly \
   -Q "INSERT INTO AuthDemoDB.dbo.ReplicationTest(msg) VALUES ('should fail');"
 # Kỳ vọng: ERROR - The target database is in a read-only state
 ```
+
+> **SSMS / Azure Data Studio kết nối vào Secondary (.39):**
+> Connection Properties → thêm `ApplicationIntent=ReadOnly` vào *Additional Connection Parameters*,
+> hoặc dùng connection string: `Server=192.168.1.39,1433;Database=AuthDemoDB;...;ApplicationIntent=ReadOnly;`
+> Nếu không có flag này, SSMS cũng báo lỗi Msg 978 và database hiện thị màu xám không mở được.
 
 #### Cấu hình .NET để dùng Read Replica (SQL Server)
 
