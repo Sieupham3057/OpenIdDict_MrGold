@@ -12,6 +12,9 @@
 - [Khi Database là bottleneck — Scale DB Layer](#khi-database-là-bottleneck--scale-db-layer)
 - [Debug thường gặp](#debug-thường-gặp)
 - [Checklist cuối cùng](#checklist-cuối-cùng)
+- [Phase 6 — Docker Swarm: Deploy một lần, scale toàn cluster](#phase-6--docker-swarm-deploy-một-lần-scale-toàn-cluster)
+- [Phase 7 — VM Registry riêng: Tách registry khỏi Manager](#phase-7--vm-registry-riêng-tách-registry-khỏi-manager)
+- [Phase 8 — Nginx Proxy Manager (NPM) trong hệ thống công ty](#phase-8--nginx-proxy-manager-npm-trong-hệ-thống-công-ty)
 
 ---
 
@@ -2262,3 +2265,1530 @@ Quan sát chính:
 ```
 
 > **Bài học thực tế:** Scale API dễ vì API là stateless. Bottleneck thật sự thường là database. Để scale tiếp sau bài này: thêm Redis cache cho GET endpoint — 1 request DB có thể phục vụ 1000 request API tiếp theo từ cache.
+
+---
+
+## Phase 6 — Docker Swarm: Deploy một lần, scale toàn cluster
+
+### Tại sao cần Swarm?
+
+Với cách manual ở Phase 2–3, mỗi lần có thay đổi bạn phải:
+
+```
+Thay đổi code:
+  VM1: git pull → docker compose build → docker compose up -d
+  VM2: git pull → docker compose build → docker compose up -d  ← phải làm lại
+
+Thay đổi config (env var, connection string):
+  VM1: sửa docker-compose.yml → docker compose up -d
+  VM2: sửa docker-compose.api-only.yml → docker compose up -d  ← phải làm lại
+
+Thêm VM3 API instance:
+  VM3: cài Docker → clone code → copy cert → cấu hình compose → chạy
+  VM1/Nginx: cập nhật nginx.conf thêm upstream → reload
+```
+
+**Với Docker Swarm**, toàn bộ những bước trên thành một lệnh duy nhất chạy trên VM1 (manager):
+
+```bash
+# Deploy hoặc update toàn bộ cluster
+docker stack deploy -c docker-stack.yml authdemo
+
+# Scale thêm instance (không cần vào VM nào)
+docker service scale authdemo_api=3
+
+# Update image mới (rolling update tự động)
+docker service update --image 192.168.1.35:5050/authdemo-api:v2 authdemo_api
+```
+
+### Kiến trúc Swarm (so với cách manual)
+
+| | Manual | Docker Swarm |
+|---|---|---|
+| **Deploy** | SSH vào từng VM, chạy compose | 1 lệnh từ manager |
+| **Update code** | Làm trên từng VM | Build 1 lần → push registry → `docker stack deploy` |
+| **Update config** | Sửa file trên từng VM | Sửa stack file → `docker stack deploy` |
+| **Scale thêm** | Tạo VM mới, cài tay, cập nhật Nginx | `docker service scale` + `docker swarm join` |
+| **Cert management** | Copy thủ công sang từng VM | Docker Secret — Swarm tự phân phối |
+| **Rolling update** | Không có, manual restart | Tự động (start-first, zero downtime) |
+| **Health check** | Tự xử lý | Swarm tự restart container fail |
+
+```
+                        [k6 — máy bạn]
+                               |
+                        POST/GET :80
+                               |
+                               v
+                   ┌─────────────────────┐
+                   │   VM1 — Manager     │
+                   │   192.168.1.35      │
+                   │                     │
+                   │ nginx-lb (:80)      │  ← Swarm service, 1 replica
+                   │ sqlserver (:1433)   │  ← stack hoặc compose riêng
+                   │ prometheus (:9090)  │  ← monitoring stack riêng
+                   │ grafana (:3000)     │
+                   │ registry (:5050)    │  ← local image registry
+                   └────────┬────────────┘
+                            │ Overlay network (authdemo_app-net)
+                  ┌─────────┴──────────┐
+                  │                    │
+        ┌─────────▼──────┐   ┌─────────▼──────┐
+        │  VM2 — Worker  │   │  VM3 — Worker  │
+        │  192.168.1.36  │   │  192.168.1.37  │
+        │                │   │                │
+        │  api (replica1)│   │  api (replica2)│
+        └────────────────┘   └────────────────┘
+```
+
+**Điểm khác biệt quan trọng với manual:**
+- Nginx không dùng IP cứng của VM2/VM3 nữa — dùng DNS tên service `tasks.api` (Swarm tự resolve ra IP container thực tế)
+- Khi thêm replica thứ 3, Nginx tự thấy — không cần sửa nginx.conf
+- Cert được lưu dưới dạng Docker Secret, Swarm encrypt và mount vào container trên mọi node
+
+---
+
+### Bước 6.1 — Khởi tạo Swarm trên VM1 (Manager)
+
+```bash
+# Trên VM1
+docker swarm init --advertise-addr 192.168.1.35
+```
+
+Output sẽ cho bạn 1 lệnh join token dạng:
+```
+Swarm initialized: current node (xxx) is now a manager.
+
+To add a worker to this swarm, run the following command:
+
+    docker swarm join --token SWMTKN-1-xxx... 192.168.1.35:2377
+```
+
+Lưu lại lệnh `docker swarm join` này. Nếu quên, lấy lại bằng:
+```bash
+docker swarm join-token worker
+```
+
+Verify manager đang chạy:
+```bash
+docker node ls
+# Kỳ vọng: 1 node, STATUS=Ready, MANAGER STATUS=Leader
+```
+
+---
+
+### Bước 6.2 — Join VM2 và VM3 vào Swarm
+
+```bash
+# Trên VM2 — dán lệnh join-token từ bước trên
+docker swarm join --token SWMTKN-1-xxx... 192.168.1.35:2377
+
+# Trên VM3
+docker swarm join --token SWMTKN-1-xxx... 192.168.1.35:2377
+```
+
+Verify trên VM1:
+```bash
+docker node ls
+# Kỳ vọng:
+# ID       HOSTNAME  STATUS  AVAILABILITY  MANAGER STATUS
+# xxx *    vm1       Ready   Active        Leader
+# yyy      vm2       Ready   Active
+# zzz      vm3       Ready   Active
+```
+
+Nếu muốn node chỉ chạy worker role (không scheduling lên manager):
+```bash
+# Trên VM1 — đặt drain cho manager để workload chỉ chạy trên worker
+docker node update --availability drain vm1
+# Worker vẫn nhận task, manager chỉ orchestrate
+```
+
+> **Lưu ý port firewall:** Swarm dùng port `2377/tcp` (quản lý cluster), `7946/tcp+udp` (node discovery), `4789/udp` (overlay network). Mở các port này nếu VM dùng UFW:
+> ```bash
+> sudo ufw allow 2377/tcp
+> sudo ufw allow 7946
+> sudo ufw allow 4789/udp
+> ```
+
+---
+
+### Bước 6.3 — Cài local registry trên VM1
+
+Swarm cần pull image từ registry khi distribute task xuống worker. Trong lab không có Docker Hub private hay registry cloud, dùng local registry chạy ngay trên VM1.
+
+```bash
+# Trên VM1 — chạy registry container (đứng ngoài Swarm, không cần HA)
+docker run -d \
+  --name registry \
+  --restart always \
+  -p 5050:5000 \
+  -v registry-data:/var/lib/registry \
+  registry:2
+
+# Verify
+curl http://localhost:5050/v2/_catalog
+# Kỳ vọng: {"repositories":[]}
+```
+
+**Cấu hình VM2 và VM3 để cho phép pull từ insecure registry** (HTTP thay vì HTTPS):
+
+```bash
+# Trên VM2 và VM3 — thêm insecure registry
+sudo nano /etc/docker/daemon.json
+```
+
+```json
+{
+  "insecure-registries": ["192.168.1.35:5050"]
+}
+```
+
+```bash
+# Restart Docker daemon để áp dụng
+sudo systemctl restart docker
+
+# Verify (có thể pull từ registry của VM1)
+docker pull 192.168.1.35:5050/hello-world || echo "registry chưa có image — OK"
+```
+
+> **Tại sao cần registry?** Khi Swarm schedule API container xuống VM2 và VM3, Docker daemon trên từng worker tự động pull image về. Nếu không có registry, worker không biết image ở đâu mà pull. Local registry là giải pháp lab nhanh nhất — production thường dùng Docker Hub private hoặc GitLab/GitHub Container Registry.
+
+---
+
+### Bước 6.4 — Build image và push lên local registry
+
+Chỉ cần làm trên VM1 (manager). VM2 và VM3 tự pull khi Swarm schedule task.
+
+```bash
+# Trên VM1
+cd ~/projects/OpenIdDict_MrGold
+
+# Build image với tag trỏ vào local registry
+docker build \
+  -f AuthDemo.Api/Dockerfile \
+  -t 192.168.1.35:5050/authdemo-api:latest \
+  .
+
+# Push lên local registry
+docker push 192.168.1.35:5050/authdemo-api:latest
+
+# Verify image đã có trong registry
+curl http://localhost:5050/v2/_catalog
+# Kỳ vọng: {"repositories":["authdemo-api"]}
+
+curl http://localhost:5050/v2/authdemo-api/tags/list
+# Kỳ vọng: {"name":"authdemo-api","tags":["latest"]}
+```
+
+---
+
+### Bước 6.5 — Tạo Docker Secret (cert) và Docker Config (nginx.conf)
+
+**Docker Secret** lưu dữ liệu nhạy cảm (cert, password) được encrypt ở Swarm store và mount vào container tại `/run/secrets/<tên>`. Không cần copy file tay sang từng VM.
+
+```bash
+# Trên VM1 — sinh cert (nếu chưa có)
+cd ~/projects/OpenIdDict_MrGold/docker/certs
+chmod +x gen-cert.sh && ./gen-cert.sh
+
+# Tạo secret từ file cert
+docker secret create openiddict_cert ./openiddict.pfx
+
+# Verify secret đã tạo (Swarm chỉ cho xem tên, không cho đọc nội dung)
+docker secret ls
+# NAME              CREATED
+# openiddict_cert   X seconds ago
+```
+
+**Docker Config** lưu file cấu hình không nhạy cảm (nginx.conf) — tương tự Secret nhưng không encrypt, có thể xem lại.
+
+Tạo file nginx.conf cho Swarm (dùng **service name** thay vì IP cứng):
+
+```bash
+# Trên VM1
+mkdir -p ~/swarm-stack
+cat > ~/swarm-stack/nginx-swarm.conf << 'EOF'
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream api_backend {
+        # tasks.api: Swarm DNS đặc biệt — resolve ra IP của TẤT CẢ task đang chạy
+        # Khi scale api từ 2 → 3, Nginx tự thấy replica mới mà không cần reload
+        server tasks.api:8080;
+        keepalive 32;
+    }
+
+    server {
+        listen 80;
+        server_name _;
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        location / {
+            proxy_pass http://api_backend;
+        }
+    }
+
+    server {
+        listen 8080;
+        location /nginx-health {
+            return 200 "nginx ok\n";
+            add_header Content-Type text/plain;
+        }
+        location /nginx-status {
+            stub_status on;
+        }
+    }
+}
+EOF
+
+# Tạo Docker Config từ file
+docker config create nginx_conf ~/swarm-stack/nginx-swarm.conf
+
+# Verify
+docker config ls
+# NAME         CREATED
+# nginx_conf   X seconds ago
+```
+
+> **`tasks.api` vs `api`:**
+> - `api` → VIP (Virtual IP) của service — Swarm/IPVS phân phối round-robin. Nginx chỉ thấy 1 IP ảo.
+> - `tasks.api` → DNS trả về danh sách IP thật của từng replica. Nginx tự load balance theo thuật toán của mình (least_conn, round-robin...).
+>
+> Dùng `tasks.api` để Nginx có thể áp dụng `least_conn` và thấy được từng backend thật.
+
+---
+
+### Bước 6.6 — Tạo docker-stack.yml
+
+```bash
+cat > ~/swarm-stack/docker-stack.yml << 'EOF'
+version: '3.8'
+
+services:
+
+  # ── API service — chạy trên Worker nodes ────────────────────────────────────
+  api:
+    image: 192.168.1.35:5050/authdemo-api:latest
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Server=192.168.1.35,1433;Database=AuthDemoDB;User Id=sa;Password=YourStrong@Passw0rd;TrustServerCertificate=True;
+      # Cert được mount từ Docker Secret tại /run/secrets/openiddict_cert
+      - OpenIddict__CertPath=/run/secrets/openiddict_cert
+      - OpenIddict__CertPassword=Lab@OpenIddict2025
+    secrets:
+      - openiddict_cert
+    networks:
+      - app-net
+    deploy:
+      replicas: 2
+      placement:
+        constraints:
+          - node.role == worker     # chỉ chạy trên VM2 và VM3
+      update_config:
+        parallelism: 1              # rolling update: stop 1 → start 1 tại 1 thời điểm
+        delay: 10s                  # chờ 10s sau mỗi replica update
+        order: start-first          # start replica mới TRƯỚC khi stop cái cũ → zero downtime
+        failure_action: rollback    # nếu replica mới unhealthy → tự rollback về version cũ
+      rollback_config:
+        parallelism: 1
+        delay: 5s
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s             # cho phép 30s khởi động trước khi health check
+
+  # ── Nginx load balancer — chạy trên Manager ─────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"       # k6 gọi vào đây
+      - "8080:8080"   # health + status
+    configs:
+      - source: nginx_conf
+        target: /etc/nginx/nginx.conf
+    networks:
+      - app-net
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager    # chạy trên VM1
+      restart_policy:
+        condition: on-failure
+
+secrets:
+  openiddict_cert:
+    external: true    # đã tạo bằng: docker secret create openiddict_cert ./openiddict.pfx
+
+configs:
+  nginx_conf:
+    external: true    # đã tạo bằng: docker config create nginx_conf nginx-swarm.conf
+
+networks:
+  app-net:
+    driver: overlay   # overlay: container trên các node khác nhau giao tiếp được
+EOF
+```
+
+> **Overlay network:** Driver `overlay` tạo một mạng ảo trải dài qua tất cả node trong Swarm. Container `nginx` trên VM1 có thể gọi thẳng đến container `api` trên VM2/VM3 qua tên service, như thể chúng cùng 1 máy.
+
+---
+
+### Bước 6.7 — Deploy stack từ VM1 (lần đầu và các lần sau)
+
+```bash
+# Trên VM1 — 1 lệnh deploy toàn bộ cluster
+cd ~/swarm-stack
+docker stack deploy -c docker-stack.yml authdemo
+```
+
+Swarm sẽ:
+1. Schedule `api` service: 1 replica → VM2, 1 replica → VM3
+2. Schedule `nginx` service: 1 replica → VM1 (manager)
+3. Phân phối Secret `openiddict_cert` đến VM2 và VM3 (encrypt qua mTLS)
+4. Mount Config `nginx_conf` vào Nginx container
+
+Theo dõi quá trình deploy:
+```bash
+# Xem trạng thái các service
+docker stack services authdemo
+# NAME             MODE         REPLICAS   IMAGE
+# authdemo_api     replicated   2/2        192.168.1.35:5050/authdemo-api:latest
+# authdemo_nginx   replicated   1/1        nginx:1.25-alpine
+
+# Xem từng task (container) đang chạy trên node nào
+docker stack ps authdemo
+# ID       NAME               NODE  DESIRED STATE  CURRENT STATE
+# xxx      authdemo_api.1     vm2   Running        Running 30s ago
+# yyy      authdemo_api.2     vm3   Running        Running 30s ago
+# zzz      authdemo_nginx.1   vm1   Running        Running 30s ago
+```
+
+Verify từ máy của bạn:
+```bash
+curl http://192.168.1.35/health
+# Kỳ vọng: {"status":"Healthy"} (từ một trong 2 API replica qua Nginx)
+
+# Verify round-robin — gọi 6 lần
+for i in $(seq 1 6); do
+  curl -s http://192.168.1.35/health
+  echo " - request $i"
+done
+```
+
+---
+
+### Bước 6.8 — Workflow khi có thay đổi
+
+#### Thay đổi code (build và deploy version mới)
+
+Tất cả làm trên VM1, VM2 và VM3 không cần động vào:
+
+```bash
+# 1. Kéo code mới
+cd ~/projects/OpenIdDict_MrGold
+git pull
+
+# 2. Build image với tag version (dùng git hash để dễ rollback)
+VERSION=$(git rev-parse --short HEAD)
+docker build \
+  -f AuthDemo.Api/Dockerfile \
+  -t 192.168.1.35:5050/authdemo-api:${VERSION} \
+  -t 192.168.1.35:5050/authdemo-api:latest \
+  .
+
+# 3. Push lên registry
+docker push 192.168.1.35:5050/authdemo-api:${VERSION}
+docker push 192.168.1.35:5050/authdemo-api:latest
+
+# 4. Rolling update — Swarm update từng replica 1, zero downtime
+docker service update \
+  --image 192.168.1.35:5050/authdemo-api:${VERSION} \
+  authdemo_api
+
+# Theo dõi quá trình rolling update
+docker service ps authdemo_api
+# Sẽ thấy: replica cũ shutdown SAU KHI replica mới healthy
+```
+
+Nếu version mới có vấn đề, rollback về version trước:
+```bash
+docker service rollback authdemo_api
+# Swarm tự đổi lại image của từng replica về version cũ
+```
+
+#### Thay đổi environment variable
+
+```bash
+# Cập nhật env var trực tiếp, không cần rebuild image
+docker service update \
+  --env-add "ConnectionStrings__DefaultConnection=Server=new-db,1433;..." \
+  authdemo_api
+# Swarm rolling restart từng replica với env mới
+```
+
+#### Thay đổi nginx.conf
+
+```bash
+# 1. Xóa config cũ và tạo config mới (Docker Config immutable — không edit được)
+docker config rm nginx_conf
+
+# Sửa file nginx-swarm.conf
+nano ~/swarm-stack/nginx-swarm.conf
+
+# Tạo config version mới
+docker config create nginx_conf_v2 ~/swarm-stack/nginx-swarm.conf
+
+# 2. Update service Nginx trỏ vào config mới
+docker service update \
+  --config-rm nginx_conf \
+  --config-add source=nginx_conf_v2,target=/etc/nginx/nginx.conf \
+  authdemo_nginx
+```
+
+> **Lưu ý:** Docker Config và Secret là immutable — một khi tạo xong không sửa được nội dung. Muốn đổi phải tạo config/secret mới với tên khác và update service trỏ vào cái mới.
+
+---
+
+### Bước 6.9 — Scale service
+
+```bash
+# Scale API từ 2 → 3 replica (Swarm tự chọn node phù hợp)
+docker service scale authdemo_api=3
+
+# Xem Swarm schedule replica mới lên node nào
+docker stack ps authdemo
+# Replica thứ 3 có thể lên VM2 hoặc VM3 tùy tải hiện tại
+
+# Scale ngược lại về 2
+docker service scale authdemo_api=2
+
+# Khi có VM4 mới join Swarm
+docker swarm join --token ... 192.168.1.35:2377  # (chạy trên VM4)
+# Scale lên 4 — replica thứ 4 sẽ tự xuống VM4
+docker service scale authdemo_api=4
+```
+
+> **Nginx `tasks.api` tự cập nhật:** Khi scale api từ 2 → 3, DNS record của `tasks.api` tự thêm IP của replica mới. Nginx (với `resolver` hoặc `keepalive` đủ thấp) sẽ tự nhận thêm backend mà không cần sửa config hay reload.
+
+---
+
+### Bước 6.10 — Monitoring Swarm
+
+```bash
+# Xem tất cả node trong cluster
+docker node ls
+
+# Xem detail 1 node (tải, resource)
+docker node inspect vm2 --pretty
+
+# Xem tất cả service đang chạy
+docker service ls
+
+# Xem log của service (gộp từ tất cả replica)
+docker service logs authdemo_api --follow --tail 50
+
+# Xem resource usage (cần chạy trên từng node hoặc dùng Portainer)
+docker stats $(docker ps -q)
+
+# Xem lịch sử task (restart, failure)
+docker service ps authdemo_api --no-trunc
+```
+
+**Portainer — UI quản lý Swarm (tùy chọn):**
+
+```bash
+# Trên VM1 — chạy Portainer agent trên tất cả node
+docker stack deploy -c ~/swarm-stack/portainer-agent.yml portainer
+```
+
+```yaml
+# ~/swarm-stack/portainer-agent.yml
+version: '3.8'
+services:
+  agent:
+    image: portainer/agent:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/var/lib/docker/volumes
+    networks:
+      - agent-net
+    deploy:
+      mode: global    # 1 agent trên MỌI node, tự động
+  portainer:
+    image: portainer/portainer-ce:latest
+    command: -H tcp://tasks.agent:9001 --tlsskipverify
+    ports:
+      - "9000:9000"
+    volumes:
+      - portainer-data:/data
+    networks:
+      - agent-net
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+networks:
+  agent-net:
+    driver: overlay
+    attachable: true
+volumes:
+  portainer-data:
+```
+
+```bash
+docker stack deploy -c ~/swarm-stack/portainer-agent.yml portainer
+# Mở http://192.168.1.35:9000 → xem toàn bộ Swarm qua UI
+```
+
+---
+
+### Bước 6.11 — Xử lý SQL Server và Monitoring (nằm ngoài Swarm)
+
+SQL Server và monitoring stack (Prometheus, Grafana, InfluxDB) **không nên đặt trong Swarm** vì:
+- SQL Server cần volume persistent, không được migrate sang node khác giữa chừng
+- Monitoring cần access vào Docker socket và metadata của host
+
+Vẫn chạy chúng bằng `docker compose` trực tiếp trên VM1 như cũ:
+
+```bash
+# Trên VM1 — monitoring stack vẫn dùng compose bình thường
+cd ~/projects/OpenIdDict_MrGold/docker
+docker compose -f docker-compose.monitoring.yml up -d
+```
+
+Tách biệt rõ ràng:
+- **Swarm** quản lý: `api` service (stateless, có thể chạy ở bất kỳ node nào)
+- **Compose** quản lý: SQL Server, Prometheus, Grafana, InfluxDB (stateful, gắn với VM1)
+
+---
+
+### So sánh: Manual Deploy vs Docker Swarm
+
+| Tình huống | Manual (Phase 2–3) | Docker Swarm (Phase 6) |
+|---|---|---|
+| **Lần đầu deploy** | SSH từng VM, compose up | `docker stack deploy` từ VM1 |
+| **Update code** | Build + up từng VM | Build 1 lần, `docker service update` |
+| **Update env var** | Sửa file từng VM + restart | `docker service update --env-add` |
+| **Update nginx.conf** | SSH vào VM3, sửa + reload | `docker config create` + `service update` |
+| **Scale 2→3 replica** | Tạo VM, cài tay, cập nhật Nginx | `docker service scale authdemo_api=3` |
+| **Cert quản lý** | Copy thủ công, dễ quên | Docker Secret — Swarm phân phối tự động |
+| **Rolling update** | Không có, downtime | Zero downtime — start-first |
+| **Rollback** | Không có | `docker service rollback` |
+| **Node health** | Không tự xử lý | Swarm tự restart task khi node fail |
+| **Quan sát cluster** | `docker ps` từng VM | `docker service ps` từ 1 nơi |
+
+### Khi nào nên dùng Swarm vs Kubernetes?
+
+| | Docker Swarm | Kubernetes |
+|---|---|---|
+| **Độ phức tạp** | Thấp — built-in Docker, ít khái niệm | Cao — nhiều abstraction (Pod, Deployment, Service, Ingress...) |
+| **Thời gian setup** | 30 phút | Vài giờ đến vài ngày |
+| **Phù hợp** | Lab, startup nhỏ-vừa, team ít người | Production lớn, nhiều service, nhiều team |
+| **Ecosystem** | Hạn chế | Rất phong phú (Helm, Istio, ArgoCD...) |
+| **Managed cloud** | Không có (tự quản) | EKS, GKE, AKS |
+| **Kết luận** | **Đúng với bài lab này** | Overkill cho 3 VM |
+
+> **Thực tế:** Docker Swarm đủ dùng cho team 5–20 người với vài chục service. Nhiều startup thành công vận hành production trên Swarm nhiều năm mà không cần migrate sang Kubernetes. Chỉ chuyển K8s khi thật sự cần: auto-scaling theo metric (HPA), multi-region, CI/CD pipeline phức tạp, hoặc team đủ lớn để vận hành.
+
+---
+
+### Nginx placement trong production — KHÔNG đặt trên Manager
+
+Cách lab này đặt Nginx trên manager (`placement: constraints: node.role == manager`) là **chấp nhận được cho học tập** nhưng sai nguyên tắc production vì 3 lý do:
+
+**1. Manager phải được bảo vệ, không expose ra internet**
+
+Manager giữ Raft consensus state của toàn cluster. Nếu manager bị tấn công hoặc quá tải vì xử lý traffic, toàn bộ Swarm mất control plane — không deploy được, không scale được, không xem được trạng thái cluster.
+
+**2. Single point of failure cho traffic**
+
+Nginx trên manager chết = toàn bộ traffic chết, dù API worker vẫn healthy hoàn toàn. Đây là SPOF không cần thiết.
+
+**3. Resource contention**
+
+Swarm management overhead + Nginx xử lý hàng nghìn connection/s trên cùng 1 node → cả 2 đều bị ảnh hưởng lẫn nhau.
+
+---
+
+#### 3 pattern production phổ biến
+
+**Pattern 1 — Dedicated edge worker (on-premise, bare metal)**
+
+Đây là cách phổ biến nhất khi tự vận hành Swarm:
+
+```
+Internet
+    │
+    ▼
+[Edge Worker VM2]  [Edge Worker VM3]   ← Nginx chạy ở đây
+    │                    │
+    └────────┬───────────┘
+             │ overlay network
+             ▼
+    [Worker pool — API replicas]
+             │
+    [VM4, VM5 — Managers × 3 hoặc 5]  ← KHÔNG nhận traffic
+```
+
+Cấu hình trong stack file: gắn label cho node và dùng `placement.constraints`:
+
+```bash
+# Trên VM1 (manager) — gắn label cho edge worker
+docker node update --label-add role=edge vm2
+docker node update --label-add role=edge vm3
+```
+
+```yaml
+# docker-stack.yml
+services:
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+    deploy:
+      replicas: 2             # 2 replica — 1 trên VM2, 1 trên VM3 → HA
+      placement:
+        constraints:
+          - node.labels.role == edge   # chạy trên edge worker, không phải manager
+      update_config:
+        parallelism: 1
+        order: start-first
+
+  api:
+    image: 192.168.1.35:5050/authdemo-api:latest
+    deploy:
+      replicas: 4
+      placement:
+        constraints:
+          - node.labels.role != edge   # API không chạy trên edge worker
+          - node.role == worker
+```
+
+Với `replicas: 2` cho Nginx và 2 edge node → Swarm đặt 1 replica trên VM2, 1 trên VM3 — Nginx vừa được load balance vừa không SPOF.
+
+---
+
+**Pattern 2 — External Load Balancer + Swarm routing mesh (cloud)**
+
+Khi deploy trên cloud (AWS, GCP, Azure), external LB đứng trước cluster, traffic đến bất kỳ worker nào, Swarm routing mesh tự route đến container đúng — không cần Nginx trong Swarm:
+
+```
+Internet
+    │
+    ▼
+[AWS ALB / GCP Load Balancer]   ← cloud-managed, HA tự động
+    │
+    ├──→ Worker VM2 :80
+    ├──→ Worker VM3 :80
+    └──→ Worker VM4 :80
+         │
+         Swarm ingress routing mesh
+         (bất kỳ node nào cũng nhận được và route đến container đúng)
+```
+
+Swarm mở port 80 trên **mọi node** khi bạn publish port trong stack. Cloud LB chỉ cần trỏ vào IP của tất cả worker — không cần biết container đang chạy trên node nào.
+
+```yaml
+services:
+  api:
+    image: ...
+    ports:
+      - "80:8080"   # publish port 80 trên mọi node trong Swarm
+    deploy:
+      replicas: 3
+      # Không cần placement constraint — Swarm tự distribute
+```
+
+Với pattern này hoàn toàn không cần Nginx container nào trong Swarm. Cloud LB xử lý TLS termination, health check, và phân phối traffic.
+
+---
+
+**Pattern 3 — Traefik thay Nginx (dynamic routing, nhiều service)**
+
+Khi có nhiều service cần routing theo path (`/api/v1`, `/api/v2`, `/admin`...) hoặc hostname, Traefik là lựa chọn phổ biến hơn Nginx trong Swarm vì nó tự động detect service mới qua Docker labels — không cần reload config:
+
+```yaml
+services:
+  traefik:
+    image: traefik:v3
+    command:
+      - "--providers.swarm=true"                    # auto-discover Swarm services
+      - "--providers.swarm.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"
+      - "8080:8080"   # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    deploy:
+      placement:
+        constraints:
+          - node.labels.role == edge   # vẫn đặt trên edge worker
+
+  api:
+    image: 192.168.1.35:5050/authdemo-api:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=PathPrefix(`/api`) || PathPrefix(`/connect`)"
+      - "traefik.http.services.api.loadbalancer.server.port=8080"
+    deploy:
+      replicas: 3
+      # Không cần ports — Traefik tự forward
+```
+
+Khi deploy service mới hoặc scale, Traefik tự cập nhật routing mà không cần restart hay reload.
+
+---
+
+#### Tóm tắt: Nginx đặt ở đâu?
+
+| Môi trường | Nginx/LB đặt ở đâu | Ghi chú |
+|---|---|---|
+| **Lab 3 VM** | Manager (chấp nhận được) | Đơn giản, đủ để học |
+| **On-premise production** | Dedicated edge worker với label | Tách biệt traffic khỏi control plane |
+| **Cloud (AWS/GCP/Azure)** | External LB của cloud | Không cần Nginx trong Swarm |
+| **Nhiều service, routing phức tạp** | Traefik trên edge worker | Auto-discover, không cần reload config |
+
+> **Nguyên tắc bất biến:** Manager không nhận traffic từ internet. Dù dùng Swarm hay Kubernetes, node control plane luôn được isolate khỏi data plane (traffic path).
+
+---
+
+## Phase 7 — VM Registry riêng: Tách registry khỏi Manager
+
+### Tại sao cần VM registry riêng?
+
+Trong Phase 6, registry chạy trên VM1 (manager) là shortcut cho lab. Vấn đề khi để lâu dài:
+
+```
+Registry trên Manager:
+  ✗ Image storage chiếm disk của manager
+  ✗ Registry push/pull tạo network I/O cạnh tranh với Swarm management traffic
+  ✗ Nếu manager restart → registry downtime → mọi deploy/pull bị block
+  ✗ Không scale được — 1 registry trên 1 node
+```
+
+```
+Registry trên VM riêng:
+  ✓ Disk riêng, không ảnh hưởng manager
+  ✓ Có thể restart/upgrade độc lập
+  ✓ Dễ backup (chỉ cần backup 1 volume trên VM này)
+  ✓ Sau này có thể nâng lên Harbor (enterprise registry) mà không đụng cluster
+```
+
+### Kiến trúc sau khi thêm VM_REG
+
+```
+[k6 — máy bạn]
+      │
+      ▼
+[VM3 / Edge Worker — Nginx :80]
+      │
+      │ overlay network
+      ▼
+[VM2 / Worker — api replica]    [VM4 / Worker — api replica]
+
+[VM1 — Manager]                 [VM_REG — 192.168.1.38]
+  ├── SQL Server (:1433)          └── registry (:5000)
+  ├── prometheus (:9090)              └── /var/lib/registry  ← image storage
+  └── grafana (:3000)
+
+Luồng deploy:
+  Developer → git push
+  VM1 (manager): git pull → docker build → docker push → VM_REG:5000
+  VM2, VM3 (workers): docker pull ← VM_REG:5000  (Swarm tự kéo khi deploy)
+```
+
+| VM | IP | Vai trò |
+|---|---|---|
+| VM1 | `192.168.1.35` | Swarm Manager + SQL Server + Monitoring |
+| VM2 | `192.168.1.36` | Swarm Worker |
+| VM3 | `192.168.1.37` | Swarm Worker (edge) |
+| **VM_REG** | **`192.168.1.38`** | **Docker Registry** |
+
+---
+
+### Bước 7.1 — Tạo VM_REG
+
+Yêu cầu tối thiểu:
+- OS: Ubuntu Server 22.04 LTS
+- CPU: 1–2 core (registry không tốn CPU, chủ yếu I/O)
+- RAM: 2 GB
+- Disk: **50 GB trở lên** — image layer tích lũy nhanh (mỗi build ~200–500 MB)
+- IP: `192.168.1.38`
+
+```bash
+# Trên VM_REG — đặt IP tĩnh
+sudo nano /etc/netplan/00-installer-config.yaml
+```
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    ens33:
+      dhcp4: false
+      addresses:
+        - 192.168.1.38/24
+      gateway4: 192.168.1.1
+      nameservers:
+        addresses: [8.8.8.8, 8.8.4.4]
+```
+
+```bash
+sudo netplan apply
+
+# Cài Docker
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
+---
+
+### Bước 7.2 — Chọn chế độ: HTTP (lab) hay HTTPS (production-like)
+
+| | HTTP (insecure) | HTTPS self-signed |
+|---|---|---|
+| **Setup** | 5 phút | 15 phút |
+| **Cấu hình client** | Thêm `insecure-registries` vào daemon.json của mọi VM | Copy cert CA vào mọi VM |
+| **Bảo mật** | Không mã hóa | Mã hóa TLS |
+| **Dùng khi** | Lab nội bộ, không ra internet | Gần production hơn, vẫn là private network |
+
+---
+
+### Bước 7.3A — Cách HTTP (insecure) — đơn giản, đủ cho lab
+
+**Trên VM_REG — chạy registry:**
+
+```bash
+mkdir -p ~/registry
+cat > ~/registry/docker-compose.yml << 'EOF'
+services:
+  registry:
+    image: registry:2
+    container_name: registry
+    ports:
+      - "5000:5000"
+    environment:
+      # Tắt delete mặc định — bật để garbage collect được
+      - REGISTRY_STORAGE_DELETE_ENABLED=true
+    volumes:
+      - registry-data:/var/lib/registry
+    restart: unless-stopped
+
+volumes:
+  registry-data:
+EOF
+
+cd ~/registry
+docker compose up -d
+
+# Verify
+curl http://localhost:5000/v2/
+# Kỳ vọng: {}
+```
+
+**Trên VM1, VM2, VM3 — cấu hình Docker daemon chấp nhận insecure registry:**
+
+```bash
+# Chạy trên TỪNG VM (VM1, VM2, VM3)
+sudo nano /etc/docker/daemon.json
+```
+
+```json
+{
+  "insecure-registries": ["192.168.1.38:5000"]
+}
+```
+
+```bash
+# Restart Docker daemon để áp dụng (trên từng VM)
+sudo systemctl restart docker
+
+# Verify — test pull từ registry
+docker pull 192.168.1.38:5000/hello-world 2>&1 | head -3
+# Kỳ vọng: "Error response from daemon: manifest unknown" hoặc similar
+# (lỗi này là đúng — chỉ confirm Docker đã kết nối được đến registry, không phải lỗi config)
+```
+
+> **Lưu ý khi restart Docker trên Swarm worker:** Swarm tự restart container sau khi Docker daemon khởi động lại. Có thể mất vài giây downtime. Làm lần lượt từng worker, không làm đồng thời.
+
+---
+
+### Bước 7.3B — Cách HTTPS self-signed — gần production hơn
+
+#### Trên VM_REG — sinh self-signed certificate
+
+```bash
+mkdir -p ~/registry/certs
+
+# Sinh cert với SAN (Subject Alternative Name) — bắt buộc từ Docker 20.x trở đi
+# Nếu dùng IP, phải có subjectAltName=IP:... thì Docker mới tin
+openssl req -newkey rsa:4096 -nodes -sha256 \
+  -keyout ~/registry/certs/registry.key \
+  -x509 -days 3650 \
+  -out ~/registry/certs/registry.crt \
+  -subj "/C=VN/ST=HCM/L=HoChiMinh/O=Lab/CN=192.168.1.38" \
+  -addext "subjectAltName=IP:192.168.1.38"
+
+ls -la ~/registry/certs/
+# Kỳ vọng: registry.crt (~2KB) và registry.key (~3KB)
+```
+
+**Chạy registry với TLS:**
+
+```bash
+cat > ~/registry/docker-compose.yml << 'EOF'
+services:
+  registry:
+    image: registry:2
+    container_name: registry
+    ports:
+      - "5000:5000"
+    environment:
+      - REGISTRY_HTTP_TLS_CERTIFICATE=/certs/registry.crt
+      - REGISTRY_HTTP_TLS_KEY=/certs/registry.key
+      - REGISTRY_STORAGE_DELETE_ENABLED=true
+    volumes:
+      - ./certs:/certs:ro
+      - registry-data:/var/lib/registry
+    restart: unless-stopped
+
+volumes:
+  registry-data:
+EOF
+
+cd ~/registry
+docker compose up -d
+
+# Verify TLS đang chạy
+curl https://192.168.1.38:5000/v2/ --cacert ~/registry/certs/registry.crt
+# Kỳ vọng: {}
+```
+
+#### Copy cert CA sang tất cả VM để Docker tin tưởng
+
+Docker có cơ chế riêng để trust cert: thư mục `/etc/docker/certs.d/<registry-host>/ca.crt`. Không cần thêm vào system CA store, không cần restart Docker daemon.
+
+```bash
+# Trên VM_REG — copy cert ra host để scp
+# (cert đã ở ~/registry/certs/registry.crt)
+
+# Từ VM_REG, push cert sang VM1, VM2, VM3
+for HOST in 192.168.1.35 192.168.1.36 192.168.1.37; do
+  ssh bank@${HOST} "sudo mkdir -p /etc/docker/certs.d/192.168.1.38:5000"
+  scp ~/registry/certs/registry.crt \
+      bank@${HOST}:/tmp/registry-ca.crt
+  ssh bank@${HOST} "sudo mv /tmp/registry-ca.crt /etc/docker/certs.d/192.168.1.38:5000/ca.crt"
+done
+
+# Verify trên VM1 (không cần restart Docker)
+ssh bank@192.168.1.35 "docker pull 192.168.1.38:5000/hello-world 2>&1 | head -3"
+# Kỳ vọng: lỗi "manifest unknown" — Docker đã kết nối HTTPS thành công
+```
+
+> **Tại sao không cần restart Docker?** Docker đọc `/etc/docker/certs.d/` mỗi khi tạo kết nối mới — không cache vào memory như system CA store.
+
+---
+
+### Bước 7.4 — Thêm Basic Authentication (tùy chọn, khuyến nghị)
+
+Không có auth → bất kỳ ai trong mạng LAN đều push/pull được. Trong lab thì không sao, nhưng staging/production nên bật.
+
+```bash
+# Trên VM_REG — tạo file password
+mkdir -p ~/registry/auth
+
+# Dùng htpasswd (httpd:2 image có sẵn tool này)
+docker run --rm httpd:2 \
+  htpasswd -Bbn admin Admin@Registry2025 \
+  > ~/registry/auth/htpasswd
+
+cat ~/registry/auth/htpasswd
+# Kỳ vọng: admin:$2y$05$...  (bcrypt hash)
+```
+
+Cập nhật `docker-compose.yml` trên VM_REG (thêm auth vào environment, chọn 1 trong 2 cách dưới):
+
+```yaml
+# Thêm vào environment của registry service:
+environment:
+  - REGISTRY_HTTP_TLS_CERTIFICATE=/certs/registry.crt
+  - REGISTRY_HTTP_TLS_KEY=/certs/registry.key
+  - REGISTRY_STORAGE_DELETE_ENABLED=true
+  - REGISTRY_AUTH=htpasswd
+  - REGISTRY_AUTH_HTPASSWD_REALM=Private Registry
+  - REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd
+
+# Thêm vào volumes:
+volumes:
+  - ./certs:/certs:ro
+  - ./auth:/auth:ro
+  - registry-data:/var/lib/registry
+```
+
+```bash
+# Restart registry với auth
+cd ~/registry
+docker compose up -d --force-recreate
+```
+
+**Login từ VM1, VM2, VM3:**
+
+```bash
+# Chạy trên từng VM — login 1 lần, credentials được lưu vào ~/.docker/config.json
+docker login 192.168.1.38:5000
+# Username: admin
+# Password: Admin@Registry2025
+# Login Succeeded
+
+# Verify credentials đã lưu
+cat ~/.docker/config.json
+# Kỳ vọng: thấy "192.168.1.38:5000" với auths entry
+```
+
+**Khi dùng với Docker Swarm** — worker cần credentials để pull image, truyền qua flag `--with-registry-auth`:
+
+```bash
+# Trên VM1 — deploy stack với registry auth
+docker stack deploy \
+  --with-registry-auth \
+  -c docker-stack.yml authdemo
+# Swarm manager tự phân phối credentials xuống từng worker node
+```
+
+---
+
+### Bước 7.5 — Cập nhật docker-stack.yml trỏ vào VM_REG
+
+Chỉ đổi image tag từ `192.168.1.35:5050` (registry cũ trên manager) thành `192.168.1.38:5000`:
+
+```yaml
+services:
+  api:
+    image: 192.168.1.38:5000/authdemo-api:latest   # ← đổi sang VM_REG
+    # ... phần còn lại giữ nguyên
+```
+
+---
+
+### Bước 7.6 — Build và push image lên VM_REG
+
+```bash
+# Trên VM1 — build và push lên registry mới
+cd ~/projects/OpenIdDict_MrGold
+
+VERSION=$(git rev-parse --short HEAD)
+
+docker build \
+  -f AuthDemo.Api/Dockerfile \
+  -t 192.168.1.38:5000/authdemo-api:${VERSION} \
+  -t 192.168.1.38:5000/authdemo-api:latest \
+  .
+
+docker push 192.168.1.38:5000/authdemo-api:${VERSION}
+docker push 192.168.1.38:5000/authdemo-api:latest
+
+# Verify image đã có trong registry
+curl http://192.168.1.38:5000/v2/_catalog
+# Kỳ vọng: {"repositories":["authdemo-api"]}
+
+curl http://192.168.1.38:5000/v2/authdemo-api/tags/list
+# Kỳ vọng: {"name":"authdemo-api","tags":["latest","abc1234"]}
+```
+
+---
+
+### Bước 7.7 — Verify worker pull được từ VM_REG
+
+```bash
+# Trên VM2 — test pull thủ công
+docker pull 192.168.1.38:5000/authdemo-api:latest
+# Kỳ vọng: Pull thành công, thấy digest của image
+
+# Deploy stack — Swarm tự kéo image xuống worker
+# Trên VM1:
+docker stack deploy -c docker-stack.yml authdemo
+
+# Theo dõi task — xác nhận image được pull từ VM_REG
+docker service ps authdemo_api
+# Cột IMAGE phải hiển thị: 192.168.1.38:5000/authdemo-api:latest
+```
+
+---
+
+### Bước 7.8 — Dọn dẹp image cũ (Garbage Collection)
+
+Registry tích lũy layer orphan sau nhiều lần push. Chạy garbage collect định kỳ để giải phóng disk:
+
+```bash
+# Trên VM_REG — chạy garbage collect (registry phải dừng hoặc ở read-only mode)
+# Cách an toàn nhất: đặt registry read-only, GC, rồi bật lại
+
+# Bước 1: Đặt registry vào read-only mode (từ chối push mới, vẫn cho pull)
+docker exec registry \
+  registry garbage-collect --dry-run /etc/docker/registry/config.yml
+# --dry-run: chỉ liệt kê sẽ xóa gì, chưa xóa thật
+
+# Bước 2: Nếu dry-run OK, chạy thật
+docker exec registry \
+  registry garbage-collect /etc/docker/registry/config.yml
+
+# Xem dung lượng trước/sau
+docker exec registry du -sh /var/lib/registry
+```
+
+**Xóa tag cụ thể trước khi GC:**
+
+```bash
+# Lấy digest của image muốn xóa
+DIGEST=$(curl -s -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+  http://192.168.1.38:5000/v2/authdemo-api/manifests/v1.0.0 \
+  -I | grep Docker-Content-Digest | awk '{print $2}' | tr -d '\r')
+
+# Xóa manifest (cần REGISTRY_STORAGE_DELETE_ENABLED=true)
+curl -X DELETE \
+  "http://192.168.1.38:5000/v2/authdemo-api/manifests/${DIGEST}"
+
+# Sau đó chạy GC để giải phóng layer thật sự
+docker exec registry \
+  registry garbage-collect /etc/docker/registry/config.yml
+```
+
+---
+
+### Debug thường gặp với Registry
+
+**`x509: cannot validate certificate for 192.168.1.38`**
+
+```
+Docker không tìm thấy CA cert để verify TLS của registry.
+```
+
+Fix:
+```bash
+# Trên VM bị lỗi — kiểm tra cert đã đúng chỗ chưa
+ls -la /etc/docker/certs.d/192.168.1.38:5000/
+# Kỳ vọng: thấy ca.crt
+
+# Nếu chưa có, copy từ VM_REG
+scp bank@192.168.1.38:~/registry/certs/registry.crt \
+    /tmp/registry-ca.crt
+sudo mkdir -p /etc/docker/certs.d/192.168.1.38:5000
+sudo mv /tmp/registry-ca.crt /etc/docker/certs.d/192.168.1.38:5000/ca.crt
+# Không cần restart Docker
+```
+
+---
+
+**`http: server gave HTTP response to HTTPS client`**
+
+```
+Docker mặc định dùng HTTPS nhưng registry đang chạy HTTP.
+```
+
+Fix: Thêm vào `/etc/docker/daemon.json` trên VM bị lỗi:
+```json
+{
+  "insecure-registries": ["192.168.1.38:5000"]
+}
+```
+```bash
+sudo systemctl restart docker
+```
+
+---
+
+**`unauthorized: authentication required` khi Swarm worker pull**
+
+```
+Worker không có credentials để pull từ registry có auth.
+```
+
+Fix: Deploy stack với flag `--with-registry-auth`:
+```bash
+# Trên VM1 (manager) — phải login trước, rồi deploy với flag này
+docker login 192.168.1.38:5000
+docker stack deploy --with-registry-auth -c docker-stack.yml authdemo
+```
+
+Swarm manager sẽ phân phối credentials (được mã hóa) xuống từng worker tự động.
+
+---
+
+**Push thành công nhưng Swarm worker vẫn dùng image cũ**
+
+```
+Docker cache image local — Swarm không tự pull lại nếu tag không đổi.
+```
+
+Fix: Dùng digest thay vì tag `latest`, hoặc force update:
+```bash
+# Cách 1: Force pull khi update service
+docker service update \
+  --force \
+  --image 192.168.1.38:5000/authdemo-api:latest \
+  authdemo_api
+# --force: bắt buộc recreate task dù image tag không đổi
+
+# Cách 2 (best practice): Luôn dùng version tag cụ thể
+docker service update \
+  --image 192.168.1.38:5000/authdemo-api:${VERSION} \
+  authdemo_api
+```
+
+---
+
+### Tổng kết kiến trúc hoàn chỉnh
+
+```
+[Developer — máy Windows]
+    │
+    │ git push
+    ▼
+[Git repo]
+    │
+    │ git pull (CI hoặc thủ công)
+    ▼
+[VM1 — Manager 192.168.1.35]
+    │ docker build
+    │ docker push
+    ▼
+[VM_REG — Registry 192.168.1.38:5000]
+    │                   ↑
+    │ image layers       │ Swarm worker tự pull
+    ▼                   │
+[VM2 — Worker .36]   [VM3 — Worker .37]
+  api replica 1         api replica 2
+    │                        │
+    └─────────┬──────────────┘
+              │ SQL Server connection
+              ▼
+    [VM1 — SQL Server :1433]
+
+Monitoring (VM1): Prometheus scrape VM2, VM3 → Grafana dashboard
+```
+
+**Mỗi component có thể restart/upgrade độc lập:**
+- VM_REG down → deploy bị block nhưng cluster vẫn chạy bình thường (worker đã có image)
+- VM1 manager down → cluster tiếp tục chạy, nhưng không deploy/scale được
+- Worker down → Swarm tự reschedule replica sang worker còn lại
+
+---
+
+## Phase 8 — Nginx Proxy Manager (NPM) trong hệ thống công ty
+
+### NPM và Nginx của project — 2 tầng khác nhau, không cạnh tranh
+
+Câu hỏi thường gặp: "Công ty đã có NPM rồi, deploy project mới thì Nginx trong Swarm/VM còn cần không?"
+
+Trả lời: **cần cả 2**, vì chúng làm 2 việc hoàn toàn khác nhau.
+
+| | **NPM (Nginx Proxy Manager)** | **Project Nginx (trong Swarm/VM)** |
+|---|---|---|
+| **Vai trò** | Edge proxy — cổng vào từ ngoài | Internal LB — phân phối giữa các API replica |
+| **Quản lý** | Toàn bộ công ty/team (nhiều project) | 1 project cụ thể |
+| **SSL/TLS** | Có — Let's Encrypt tự động gia hạn | Không cần — nội mạng không cần mã hóa |
+| **Domain** | Ánh xạ domain → project cụ thể | Không biết domain, chỉ biết upstream |
+| **Scope** | Biết tất cả project | Chỉ biết API replicas của project mình |
+
+```
+[Browser / Team / Internet]
+           │
+           │ HTTPS (SSL do NPM quản lý)
+           ▼
+  ┌────────────────────┐
+  │  NPM — :443        │   ← VM NPM của công ty (đã có sẵn)
+  │  project-a.dev     │──→ http://192.168.1.37:80   (Project A)
+  │  project-b.dev     │──→ http://192.168.1.50:80   (Project B)
+  │  admin.dev         │──→ http://192.168.1.60:80   (Admin)
+  └────────────────────┘
+           │
+           │ HTTP (nội mạng, không cần SSL)
+           ▼
+  ┌────────────────────┐
+  │  Project Nginx :80 │   ← Nginx của project này (Swarm service hoặc VM riêng)
+  │  upstream api      │
+  └────────┬───────────┘
+           │
+      ┌────┴────┐
+      ▼         ▼
+  [API VM2]  [API VM3]     ← API replicas
+```
+
+**Lý do traffic nội bộ (NPM → Project Nginx) dùng HTTP, không cần HTTPS:**
+- Đây là traffic trong private network (LAN/VLAN nội bộ) — không đi qua internet
+- SSL/TLS tốn CPU để encrypt/decrypt mà không tăng thêm bảo mật khi đã trên nội mạng
+- NPM đã terminate SSL ở edge — đây là pattern "SSL termination at edge" chuẩn
+
+---
+
+### 3 pattern tích hợp với NPM
+
+**Pattern 1 — NPM → Project Nginx → API (khuyến nghị)**
+
+Đây là pattern chuẩn khi project cần load balancing nâng cao (least_conn, health check, header injection):
+
+```
+NPM ──HTTP──→ Project Nginx :80 ──→ API replica 1
+                                ──→ API replica 2
+                                ──→ API replica 3
+```
+
+**Cấu hình trong NPM:**
+
+Vào NPM UI → Proxy Hosts → Add Proxy Host:
+
+```
+Domain Names:     project-a.yourdomain.com
+Scheme:           http
+Forward Hostname: 192.168.1.37          ← IP của VM chạy Nginx, hoặc IP bất kỳ worker nếu dùng Swarm
+Forward Port:     80
+Cache Assets:     OFF
+Block Common Exploits: ON
+
+SSL tab:
+  SSL Certificate: Let's Encrypt (NPM tự xin và gia hạn)
+  Force SSL: ON
+  HTTP/2 Support: ON
+```
+
+Project Nginx giữ nguyên config như Phase 3 hoặc Phase 6 — không đổi gì.
+
+---
+
+**Pattern 2 — NPM → API trực tiếp (không có project Nginx)**
+
+Khi project chỉ có 1 API instance, hoặc NPM đủ làm LB:
+
+```
+NPM ──HTTP──→ API VM1 :5000
+          ──→ API VM2 :5000   (NPM tự round-robin nếu cấu hình upstream)
+```
+
+Với NPM cơ bản (open-source), upstream chỉ là 1 host. Muốn round-robin nhiều host cần NPM phiên bản có hỗ trợ upstream, hoặc dùng custom Nginx config.
+
+> **Giới hạn:** NPM open-source không có UI để cấu hình upstream nhiều host. Nếu cần LB thực sự, vẫn cần Project Nginx.
+
+---
+
+**Pattern 3 — NPM → Swarm routing mesh (không cần Project Nginx riêng)**
+
+Khi dùng Docker Swarm với routing mesh, bất kỳ worker node nào cũng có thể nhận traffic và tự route vào đúng container. NPM chỉ cần trỏ vào 1 trong các worker:
+
+```
+NPM ──HTTP──→ 192.168.1.36:5000 (worker VM2, port được Swarm publish)
+              Swarm routing mesh tự route → API replica 1, 2, 3
+```
+
+**Cấu hình trong NPM:**
+
+```
+Forward Hostname: 192.168.1.36      ← IP bất kỳ worker trong Swarm
+Forward Port:     5000              ← port Swarm đang publish
+```
+
+Swarm đảm bảo bất kể request vào worker nào, đều được forward đến replica đang available.
+
+> **Nhược điểm:** NPM chỉ biết 1 worker → nếu worker đó chết, NPM không tự failover. Workaround: dùng HAProxy hoặc keepalived trước NPM để có VIP, hoặc cấu hình NPM upstream nhiều host (nếu version hỗ trợ).
+
+---
+
+### Khi nào KHÔNG routing qua NPM
+
+Một số trường hợp project **không** cần đi qua NPM:
+
+| Trường hợp | Xử lý |
+|---|---|
+| API chỉ cho internal service gọi (service-to-service) | Gọi thẳng IP:port nội mạng, không cần domain, không cần SSL |
+| Staging/dev environment trong LAN | Truy cập qua IP:port trực tiếp, không cần domain |
+| Database, Redis, message queue | Không bao giờ expose qua NPM — chỉ cho phép internal |
+| Monitoring (Grafana, Prometheus) | Có thể qua NPM nếu cần truy cập từ ngoài, không bắt buộc |
+
+---
+
+### Checklist khi thêm project mới vào NPM
+
+```
+[ ] 1. Project Nginx/Swarm đã chạy và healthy (curl http://internal-ip/health → OK)
+[ ] 2. Kiểm tra port không conflict với project khác trong NPM
+[ ] 3. Tạo Proxy Host trong NPM:
+        - Domain: project.yourdomain.com
+        - Forward: http://internal-ip:port
+        - SSL: Let's Encrypt
+[ ] 4. Verify domain resolve đúng (dig project.yourdomain.com)
+[ ] 5. Test HTTPS từ trình duyệt
+[ ] 6. Test API qua HTTPS:
+        curl https://project.yourdomain.com/health
+[ ] 7. Kiểm tra NPM không cache response API (Cache Assets: OFF)
+[ ] 8. Cấu hình timeout phù hợp nếu API có endpoint chạy lâu:
+```
+
+**Cấu hình timeout trong NPM (Advanced tab — custom Nginx config):**
+
+```nginx
+# Dán vào ô "Advanced" của Proxy Host trong NPM UI
+proxy_connect_timeout 60s;
+proxy_send_timeout    300s;   # tăng nếu có endpoint xử lý lâu (export, report...)
+proxy_read_timeout    300s;
+proxy_buffering       off;    # tắt buffering nếu dùng SSE/WebSocket/streaming
+```
+
+**Nếu project dùng WebSocket (SignalR):**
+
+```nginx
+# Advanced tab trong NPM
+proxy_http_version 1.1;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection "upgrade";
+proxy_set_header Host $host;
+proxy_cache_bypass $http_upgrade;
+```
+
+---
+
+### Tóm tắt: Dùng NPM như thế nào?
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │              NPM (1 VM, toàn công ty)        │
+                    │                                              │
+                    │  project-a.dev → http://192.168.1.37:80     │
+                    │  project-b.dev → http://192.168.1.50:80     │
+                    │  admin.dev     → http://192.168.1.60:5000   │
+                    └────────────────────┬────────────────────────┘
+                                         │ HTTP (nội mạng)
+                         ┌───────────────┼───────────────┐
+                         ▼               ▼               ▼
+               [Project A Nginx]  [Project B API]  [Admin API]
+               (Swarm service)    (single VM)      (single VM)
+                    │
+               ┌────┴────┐
+           [API VM2]  [API VM3]
+```
+
+> **Nguyên tắc:**
+> - NPM = cổng vào duy nhất từ ngoài → mọi project đều qua đây để có SSL + domain
+> - Project Nginx = load balancer nội bộ → chỉ project nào có nhiều replica mới cần
+> - Traffic NPM → backend luôn là HTTP plain (nội mạng) — không setup SSL 2 lần
+> - NPM không biết bên trong project có bao nhiêu replica — đó là việc của Project Nginx/Swarm
