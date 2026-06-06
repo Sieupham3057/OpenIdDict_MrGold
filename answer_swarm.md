@@ -51,6 +51,19 @@
   - [AM.7 — Viết alerting rules (basic.yml + swarm.yml)](#bước-am7--viết-alerting-rules)
   - [AM.8 — Reload config không cần restart](#bước-am8--reload-config-không-cần-restart)
   - [Luồng end-to-end khi có sự cố](#luồng-hoạt-động-end-to-end-khi-có-sự-cố)
+- [Part 7 — Thực hành Nginx Load Balancing (192.168.1.60)](#part-7--thực-hành-nginx-load-balancing-192168160--làm-quen-trước-khi-setup-vip)
+  - [NX.1 — Tạo VM và cài Docker + Nginx](#bước-nx1--tạo-vm-192168160-và-cài-docker--nginx)
+  - [NX.2 — Cấu hình Nginx cơ bản + Upstream](#bước-nx2--cấu-hình-nginx-cơ-bản--upstream)
+  - [NX.3 — Test Load Balancing với curl, ab, wrk](#bước-nx3--test-load-balancing-với-curl-ab-và-wrk)
+  - [NX.4 — Thử các thuật toán phân tải + passive health check](#bước-nx4--thử-các-thuật-toán-phân-tải)
+  - [NX.5 — Advanced: Upload file lớn (client_max_body_size + timeout)](#nx5-advanced--upload-file-lớn-client_max_body_size--timeout)
+  - [NX.6 — Advanced: Timeout tuning cho API chậm + WebSocket](#nx6-advanced--timeout-tuning-cho-api-chậm)
+  - [NX.7 — Advanced: Rate Limiting (chặn brute-force + DDoS cơ bản)](#nx7-advanced--rate-limiting-chặn-ddos-cơ-bản)
+  - [NX.8 — Advanced: Buffer Tuning](#nx8-advanced--buffer-tuning)
+  - [NX.9 — Advanced: Gzip Compression](#nx9-advanced--gzip-compression)
+  - [NX.10 — Advanced: Proxy Cache](#nx10-advanced--proxy-cache)
+  - [NX.11 — Advanced: Security Headers + Connection Limits](#nx11-advanced--security-headers--connection-limits)
+  - [NX.12 — Cheatsheet Tech Lead](#nx12--cheatsheet-tech-lead-nginx-directives-quan-trọng)
 - [So sánh tổng hợp và khi nào dùng gì](#so-sánh-tổng-hợp)
 - [Troubleshooting thường gặp](#troubleshooting-thường-gặp)
 
@@ -444,47 +457,47 @@ keepalived --version   # Kỳ vọng: Keepalived v2.x
 sudo nano /etc/keepalived/keepalived.conf
 ```
 
-```
-# /etc/keepalived/keepalived.conf — MASTER
+<pre style="background:#282c34;color:#abb2bf;padding:16px;border-radius:6px;overflow-x:auto;font-size:0.875em;line-height:1.6;font-family:monospace;">
+<span style="color:#61afef;"># /etc/keepalived/keepalived.conf — MASTER</span>
 
 vrrp_script check_nginx {
     script "docker inspect --format='{{.State.Running}}' nginx-lb | grep -q true"
-    interval 2        # kiểm tra mỗi 2 giây
-    weight -30        # nếu nginx chết → priority giảm 30 → Backup (90) thắng Master (100-30=70)
-    fall 2            # fail 2 lần liên tiếp mới tính là down
-    rise 2            # pass 2 lần liên tiếp mới tính là up lại
+    interval 2        <span style="color:#61afef;"># kiểm tra mỗi 2 giây</span>
+    weight -30        <span style="color:#61afef;"># nếu nginx chết → priority giảm 30 → Backup (90) thắng Master (100-30=70)</span>
+    fall 2            <span style="color:#61afef;"># fail 2 lần liên tiếp mới tính là down</span>
+    rise 2            <span style="color:#61afef;"># pass 2 lần liên tiếp mới tính là up lại</span>
 }
 
 vrrp_instance VI_NGINX {
     state MASTER
-    interface ens33          # tên interface — kiểm tra: ip a | grep "^[0-9]"
-    virtual_router_id 51     # ID nhóm VRRP — phải giống nhau trên cả 2 node
-                             # Chọn số 1-255, không trùng với VRRP khác trong mạng
-    priority 100             # Master cao hơn Backup
+    interface ens33          <span style="color:#61afef;"># tên interface — kiểm tra: ip a | grep "^[0-9]"</span>
+    virtual_router_id 51     <span style="color:#61afef;"># ID nhóm VRRP — phải giống nhau trên cả 2 node</span>
+                             <span style="color:#61afef;"># Chọn số 1-255, không trùng với VRRP khác trong mạng</span>
+    priority 100             <span style="color:#61afef;"># Master cao hơn Backup</span>
 
-    advert_int 1             # gửi VRRP advertisement mỗi 1 giây
-    preempt_delay 10         # chờ 10s sau khi recover trước khi giành lại VIP
-                             # Tránh VIP nhảy liên tục khi Master vừa khởi động
+    advert_int 1             <span style="color:#61afef;"># gửi VRRP advertisement mỗi 1 giây</span>
+    preempt_delay 10         <span style="color:#61afef;"># chờ 10s sau khi recover trước khi giành lại VIP</span>
+                             <span style="color:#61afef;"># Tránh VIP nhảy liên tục khi Master vừa khởi động</span>
 
     authentication {
         auth_type PASS
-        auth_pass Lab@VRRP2025   # password chung, phải giống ở 2 node
+        auth_pass Lab@VRRP2025   <span style="color:#61afef;"># password chung, phải giống ở 2 node</span>
     }
 
     virtual_ipaddress {
-        192.168.1.36/24 dev ens33   # VIP — cùng subnet với .37 và .43
+        192.168.1.36/24 dev ens33   <span style="color:#61afef;"># VIP — cùng subnet với .37 và .43</span>
     }
 
     track_script {
-        check_nginx    # theo dõi trạng thái nginx, giảm priority nếu fail
+        check_nginx    <span style="color:#61afef;"># theo dõi trạng thái nginx, giảm priority nếu fail</span>
     }
 
-    # Thông báo khi VIP thay đổi (tùy chọn)
-    notify_master "/bin/bash -c 'echo MASTER > /tmp/keepalived-state'"
-    notify_backup "/bin/bash -c 'echo BACKUP > /tmp/keepalived-state'"
-    notify_fault  "/bin/bash -c 'echo FAULT  > /tmp/keepalived-state'"
+    <span style="color:#61afef;"># Thông báo khi VIP thay đổi (tùy chọn)</span>
+    notify_master "/bin/bash -c 'echo MASTER &gt; /tmp/keepalived-state'"
+    notify_backup "/bin/bash -c 'echo BACKUP &gt; /tmp/keepalived-state'"
+    notify_fault  "/bin/bash -c 'echo FAULT  &gt; /tmp/keepalived-state'"
 }
-```
+</pre>
 
 **Bước KA.4 — Cấu hình Keepalived trên Backup (192.168.1.43)**
 
@@ -492,46 +505,46 @@ vrrp_instance VI_NGINX {
 sudo nano /etc/keepalived/keepalived.conf
 ```
 
-```
-# /etc/keepalived/keepalived.conf — BACKUP (192.168.1.43)
-# Nội dung gần giống Master (.37), CHỈ KHÁC 2 dòng: state và priority.
+<pre style="background:#282c34;color:#abb2bf;padding:16px;border-radius:6px;overflow-x:auto;font-size:0.875em;line-height:1.6;font-family:monospace;">
+<span style="color:#61afef;"># /etc/keepalived/keepalived.conf — BACKUP (192.168.1.43)</span>
+<span style="color:#61afef;"># Nội dung gần giống Master (.37), CHỈ KHÁC 2 dòng: state và priority.</span>
 
-# Script kiểm tra Nginx container còn chạy không — giống hệt Master.
+<span style="color:#61afef;"># Script kiểm tra Nginx container còn chạy không — giống hệt Master.</span>
 vrrp_script check_nginx {
     script "docker inspect --format='{{.State.Running}}' nginx-lb | grep -q true"
-    interval 2     # kiểm tra mỗi 2 giây
-    weight -30     # nếu nginx chết → priority giảm 30 (90-30=60) → thua Master (100) luôn
-    fall 2         # fail 2 lần liên tiếp mới tính là down
-    rise 2         # pass 2 lần liên tiếp mới tính là up lại
+    interval 2     <span style="color:#61afef;"># kiểm tra mỗi 2 giây</span>
+    weight -30     <span style="color:#61afef;"># nếu nginx chết → priority giảm 30 (90-30=60) → thua Master (100) luôn</span>
+    fall 2         <span style="color:#61afef;"># fail 2 lần liên tiếp mới tính là down</span>
+    rise 2         <span style="color:#61afef;"># pass 2 lần liên tiếp mới tính là up lại</span>
 }
 
 vrrp_instance VI_NGINX {
-    state BACKUP             # ← KHÁC Master: khởi động ở trạng thái BACKUP (chờ)
-    interface ens33          # tên network interface — kiểm tra bằng: ip a
-    virtual_router_id 51     # PHẢI giống Master (51) — để 2 node nhận ra nhau là 1 nhóm VRRP
-    priority 90              # ← KHÁC Master: thấp hơn (90 < 100) → Master thắng khi cả 2 sống
-    advert_int 1             # gửi heartbeat mỗi 1 giây để phát hiện Master còn sống không
-    preempt_delay 10         # sau khi Master recover, chờ 10s rồi mới trả VIP về Master
-                             # tránh VIP nhảy liên tục khi Master vừa khởi động
+    state BACKUP             <span style="color:#61afef;"># ← KHÁC Master: khởi động ở trạng thái BACKUP (chờ)</span>
+    interface ens33          <span style="color:#61afef;"># tên network interface — kiểm tra bằng: ip a</span>
+    virtual_router_id 51     <span style="color:#61afef;"># PHẢI giống Master (51) — để 2 node nhận ra nhau là 1 nhóm VRRP</span>
+    priority 90              <span style="color:#61afef;"># ← KHÁC Master: thấp hơn (90 &lt; 100) → Master thắng khi cả 2 sống</span>
+    advert_int 1             <span style="color:#61afef;"># gửi heartbeat mỗi 1 giây để phát hiện Master còn sống không</span>
+    preempt_delay 10         <span style="color:#61afef;"># sau khi Master recover, chờ 10s rồi mới trả VIP về Master</span>
+                             <span style="color:#61afef;"># tránh VIP nhảy liên tục khi Master vừa khởi động</span>
 
     authentication {
         auth_type PASS
-        auth_pass Lab@VRRP2025   # PHẢI giống Master — để 2 node xác thực nhau qua mạng
+        auth_pass Lab@VRRP2025   <span style="color:#61afef;"># PHẢI giống Master — để 2 node xác thực nhau qua mạng</span>
     }
 
     virtual_ipaddress {
-        192.168.1.36/24 dev ens33   # VIP sẽ được gán vào đây khi Master chết
+        192.168.1.36/24 dev ens33   <span style="color:#61afef;"># VIP sẽ được gán vào đây khi Master chết</span>
     }
 
     track_script {
-        check_nginx   # nếu nginx-lb container chết → priority tụt → không tranh VIP với Master
+        check_nginx   <span style="color:#61afef;"># nếu nginx-lb container chết → priority tụt → không tranh VIP với Master</span>
     }
 
-    # Ghi trạng thái ra file để debug dễ: cat /tmp/keepalived-state
-    notify_master "/bin/bash -c 'echo MASTER > /tmp/keepalived-state'"
-    notify_backup "/bin/bash -c 'echo BACKUP > /tmp/keepalived-state'"
+    <span style="color:#61afef;"># Ghi trạng thái ra file để debug dễ: cat /tmp/keepalived-state</span>
+    notify_master "/bin/bash -c 'echo MASTER &gt; /tmp/keepalived-state'"
+    notify_backup "/bin/bash -c 'echo BACKUP &gt; /tmp/keepalived-state'"
 }
-```
+</pre>
 
 **Bước KA.5 — Khởi động và verify**
 
@@ -4962,3 +4975,1278 @@ k6 + InfluxDB:
 | 192.168.1.42 | Swarm Worker2 | Docker, Node Exporter :9100, cAdvisor :8081 |
 | 192.168.1.50 | Private Registry | Docker Registry / Harbor |
 | **192.168.1.51** | **Monitoring** | **Prometheus :9090, Grafana :3000, InfluxDB :8086, Node Exporter :9100, cAdvisor :8081** |
+
+---
+
+## Part 7 — Thực hành Nginx Load Balancing (192.168.1.60) — Làm quen trước khi setup VIP
+
+### Mục tiêu của session này
+
+Đây là bước **bắt buộc trước khi setup Keepalived + VIP**. Nginx thuần trên 1 VM đơn là nền tảng — phải nắm chắc trước khi thêm complexity.
+
+**VM mới: 192.168.1.60** — dùng riêng để thực hành, không chạm vào hệ thống hiện tại (.37, .43).
+
+```
+Kiến trúc session này (KHÔNG dùng VIP, KHÔNG dùng Keepalived):
+
+[Client / Postman / curl / ab / wrk / k6]
+               │
+               ▼  (gọi trực tiếp IP .60)
+     ┌─────────────────────┐
+     │   Nginx Practice     │  192.168.1.60
+     │   port 80 / 8080     │  ← VM mới, chỉ Nginx
+     └──────────┬──────────┘
+                │
+        ┌───────┼───────┐
+        ▼       ▼       ▼
+   192.168.1.40 .41    .42    ← Swarm backend — giữ nguyên từ Part 3
+      port 80  port 80 port 80
+```
+
+> **Backend .40/.41/.42 giữ nguyên** — chỉ thêm VM .60 làm Nginx practice node. Sau khi thành thạo session này, chuyển sang cấu hình Keepalived + VIP trên .37/.43 sẽ dễ hơn nhiều.
+
+---
+
+### Bước NX.1 — Tạo VM 192.168.1.60 và cài Docker + Nginx
+
+```bash
+# Clone từ một VM Ubuntu Server 22.04 đang có trong lab
+# Sau khi clone: đổi hostname và IP
+
+# 1. Đổi hostname
+sudo hostnamectl set-hostname nginx-practice
+
+# 2. Đổi IP trong netplan
+sudo nano /etc/netplan/00-installer-config.yaml
+```
+
+```yaml
+# /etc/netplan/00-installer-config.yaml
+network:
+  version: 2
+  ethernets:
+    ens33:
+      addresses:
+        - 192.168.1.60/24
+      gateway4: 192.168.1.1
+      nameservers:
+        addresses: [8.8.8.8, 8.8.4.4]
+```
+
+```bash
+sudo netplan apply
+ip a   # verify: thấy 192.168.1.60
+
+# 3. Cài Docker
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+newgrp docker
+docker --version   # Kỳ vọng: Docker 24.x+
+
+# 4. Kiểm tra trạng thái firewall trước
+sudo ufw status
+# Có 2 trường hợp:
+#
+#   "Status: inactive"  → ufw chưa bật → tất cả port mở mặc định
+#                         Không cần làm gì thêm, bỏ qua các lệnh ufw bên dưới
+#                         "ufw reload" sẽ báo: Firewall not enabled (skipping reload)
+#                         → bình thường, không phải lỗi
+#
+#   "Status: active"    → ufw đang bật → phải add rule mới kết nối được
+#                         Chạy các lệnh bên dưới
+
+# Chỉ chạy khi "Status: active":
+sudo ufw allow 80/tcp
+sudo ufw allow 8080/tcp
+sudo ufw reload
+
+# ── Nếu muốn bật ufw cho lab (tuỳ chọn) ────────────────────────────────
+# QUAN TRỌNG: allow SSH trước khi enable — nếu không sẽ mất SSH vào VM
+# sudo ufw allow 22/tcp
+# sudo ufw enable       ← nhập "y" khi được hỏi
+# sudo ufw status       ← verify: Status: active
+
+# 5. Verify ping đến Swarm backend
+ping -c 2 192.168.1.40
+ping -c 2 192.168.1.41
+ping -c 2 192.168.1.42
+# Kỳ vọng: tất cả ping OK
+```
+
+---
+
+### Bước NX.2 — Cấu hình Nginx cơ bản + Upstream
+
+```bash
+mkdir -p ~/nginx-practice
+cd ~/nginx-practice
+```
+
+```bash
+cat > ~/nginx-practice/nginx.conf << 'EOF'
+# ══════════════════════════════════════════════════════════════════
+# nginx.conf — Practice node 192.168.1.60
+# Load balance đến Swarm cluster (.40 / .41 / .42)
+# ══════════════════════════════════════════════════════════════════
+
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    sendfile        on;
+    tcp_nopush      on;
+    tcp_nodelay     on;
+    server_tokens   off;
+    keepalive_timeout 65;
+
+    # ─── Log format chi tiết để quan sát load balancing ─────────────────
+    # upstream_addr    : backend nào xử lý request → verify round-robin
+    # upstream_rt      : backend mất bao lâu → phát hiện backend chậm
+    # total_rt         : latency thật của client (bao gồm thời gian Nginx)
+    log_format detail '$remote_addr [$time_local] "$request" '
+                      '$status $body_bytes_sent '
+                      'upstream="$upstream_addr" '
+                      'upstream_rt=$upstream_response_time '
+                      'total_rt=$request_time';
+
+    access_log /var/log/nginx/access.log detail;
+    error_log  /var/log/nginx/error.log warn;
+
+    # ─── Upstream group: Swarm backend cluster ──────────────────────────
+    upstream swarm_backend {
+        # Thuật toán hiện tại: round-robin (default)
+        # Bỏ comment 1 dòng để thực hành từng thuật toán:
+        # least_conn;                ← tốt nhất cho API xử lý không đồng đều
+        # ip_hash;                   ← sticky session (cẩn thận: không cân bằng tốt)
+        # random two least_conn;     ← tốt cho >10 backend
+
+        # max_fails + fail_timeout: passive health check
+        # Nếu .40 fail 3 lần trong 30s → đánh dấu down, bỏ qua 30s → thử lại
+        server 192.168.1.40:80 weight=1 max_fails=3 fail_timeout=30s;
+        server 192.168.1.41:80 weight=1 max_fails=3 fail_timeout=30s;
+        server 192.168.1.42:80 weight=1 max_fails=3 fail_timeout=30s;
+
+        # Giữ sẵn 32 TCP connection persistent đến mỗi backend
+        # Tránh overhead TCP handshake khi có nhiều request liên tiếp
+        keepalive 32;
+    }
+
+    # ─── Server block chính ─────────────────────────────────────────────
+    server {
+        listen 80;
+        server_name _;
+
+        proxy_connect_timeout 10s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
+
+        # HTTP/1.1 + xóa Connection header để keepalive upstream hoạt động
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        # Truyền thông tin client thật lên backend
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Buffer response từ backend trước khi gửi cho client
+        proxy_buffering         on;
+        proxy_buffer_size       4k;
+        proxy_buffers           8 16k;
+        proxy_busy_buffers_size 32k;
+
+        location / {
+            proxy_pass http://swarm_backend;
+        }
+
+        location /nginx-health {
+            access_log off;
+            return 200 "healthy\n";
+            add_header Content-Type text/plain;
+        }
+    }
+
+    # ─── Server block status (port 8080) ────────────────────────────────
+    server {
+        listen 8080;
+
+        location /nginx-status {
+            stub_status on;
+            access_log  off;
+            # Truy cập bằng: docker exec nginx-practice curl http://localhost:8080/nginx-status
+            # Không dùng "curl localhost:8080" từ VM host — Docker NAT đổi source IP
+            # thành 172.17.0.1 (bridge gateway), không match 127.0.0.1
+            allow 127.0.0.1;          # bên trong container
+            allow 192.168.1.0/24;     # các VM khác trong lab (Prometheus scrape)
+            deny all;
+        }
+
+        location /nginx-health {
+            access_log off;
+            return 200 "ok\n";
+            add_header Content-Type text/plain;
+        }
+    }
+}
+EOF
+```
+
+```bash
+cat > ~/nginx-practice/docker-compose.yml << 'EOF'
+services:
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: nginx-practice
+    ports:
+      - "80:80"
+      - "8080:8080"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx-logs:/var/log/nginx
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/nginx-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  nginx-logs:
+EOF
+```
+
+```bash
+# Khởi động
+docker compose up -d
+
+# Verify
+docker ps
+curl http://localhost:8080/nginx-health                                    # Kỳ vọng: ok
+docker exec nginx-practice curl http://localhost:8080/nginx-status         # Kỳ vọng: Active connections: 1
+# Lưu ý: dùng docker exec để curl chạy BÊN TRONG container (127.0.0.1 đúng)
+# KHÔNG dùng "curl localhost:8080/nginx-status" từ VM host — Docker NAT đổi
+# source IP thành bridge gateway, không match allow 127.0.0.1 trong config
+```
+
+---
+
+### Bước NX.3 — Test Load Balancing với curl, ab và wrk
+
+**Test cơ bản với curl — quan sát upstream trong log:**
+
+```bash
+# Gửi 9 request, mỗi request in ra HTTP status code
+for i in $(seq 1 9); do
+    curl -s http://192.168.1.60/ -o /dev/null -w "request $i: HTTP %{http_code}\n"
+done
+
+# Xem log — cột upstream= phải luân phiên .40 / .41 / .42
+# LƯU Ý: access.log trong image Nginx chính thức là symlink → /dev/stdout
+# Dùng "docker exec ... cat/tail" sẽ treo terminal vì đọc stdout vô tận.
+# Thay bằng "docker logs" để Docker đọc stream đã capture sẵn.
+docker logs --tail 20 nginx-practice
+# Tìm trường upstream="..." để xác nhận round-robin đang hoạt động
+```
+
+**Đếm phân phối request bằng awk:**
+
+```bash
+# Gửi 30 request
+for i in $(seq 1 30); do curl -s http://192.168.1.60/ -o /dev/null; done
+
+# Đếm mỗi backend nhận bao nhiêu
+docker logs nginx-practice \
+  | grep -oP 'upstream="\K[^"]+' \
+  | sort | uniq -c | sort -rn
+# Kỳ vọng round-robin: 3 backend mỗi cái ~10 request
+```
+
+**Test với Apache Benchmark (ab) — nhiều request đồng thời:**
+
+```bash
+# Cài ab trên VM .60
+sudo apt install -y apache2-utils
+
+# 100 request, 10 concurrent
+ab -n 100 -c 10 http://192.168.1.60/
+
+# 1000 request, 50 concurrent — stress test nhẹ
+ab -n 1000 -c 50 http://192.168.1.60/
+
+# Output quan trọng cần đọc:
+# Requests per second:    500.00 [#/sec]   ← throughput
+# Time per request:         2.000 [ms]      ← latency trung bình
+# Time per request:       100.000 [ms]      ← latency per request (concurrent)
+# Transfer rate:           xxx [Kbytes/sec]
+# Failed requests:           0               ← phải là 0
+
+# Sau khi chạy xong, kiểm tra phân phối:
+docker logs nginx-practice \
+  | grep -oP 'upstream="\K[^"]+' \
+  | sort | uniq -c
+# round-robin: mỗi backend ~333 request
+```
+
+**Test với wrk — realistic hơn ab:**
+
+```bash
+# Cài wrk
+sudo apt install -y wrk
+
+# 30 giây, 10 thread, 50 concurrent connections
+wrk -t10 -c50 -d30s http://192.168.1.60/
+
+# Output:
+# Running 30s test @ http://192.168.1.60/
+#   10 threads and 50 connections
+#   Thread Stats   Avg      Stdev     Max   ±Stdev
+#     Latency    40.12ms   15.23ms 120.45ms   75.00%
+#     Req/Sec   125.40     20.10   200.00     68.00%
+#   Latency Distribution
+#      50%   35.23ms
+#      75%   50.12ms
+#      90%   65.43ms
+#      99%  120.45ms    ← P99: latency của 1% request chậm nhất
+#   37620 requests in 30.00s, 12.40MB read
+# Requests/sec:   1254.00    ← throughput tổng
+```
+
+**Xem stub_status realtime trong khi đang test:**
+
+```bash
+# Terminal 1: chạy wrk liên tục
+wrk -t5 -c100 -d60s http://192.168.1.60/ &
+
+# Terminal 2: watch stub_status mỗi giây (chạy curl bên trong container)
+watch -n 1 'docker exec nginx-practice curl -s http://localhost:8080/nginx-status'
+
+# Output mẫu khi đang load:
+# Active connections: 105
+# server accepts handled requests
+#  50000 50000 100000
+# Reading: 0 Writing: 105 Waiting: 0
+#
+# Reading  : đang đọc request header từ client
+# Writing  : đang gửi response về client (105 = 105 concurrent)
+# Waiting  : keep-alive connection đang nhàn, chờ request mới
+```
+
+---
+
+### Bước NX.4 — Thử các thuật toán phân tải
+
+**Thí nghiệm 1: Round-robin (default)**
+
+```bash
+# Config mặc định (không comment gì thêm trong upstream block)
+# Ghi timestamp trước khi test — dùng --since để lọc log của đúng lần chạy này
+# (không thể truncate vì access.log → /dev/stdout trong container Nginx)
+START=$(date +%Y-%m-%dT%H:%M:%S)
+
+ab -n 300 -c 30 http://192.168.1.60/ 2>/dev/null
+
+docker logs --since "$START" nginx-practice \
+  | grep -oP 'upstream="\K[^"]+' \
+  | sort | uniq -c
+# Kỳ vọng: 3 backend mỗi cái ~100 request (đều nhau)
+```
+
+**Thí nghiệm 2: least_conn — tốt hơn khi request có thời gian xử lý khác nhau**
+
+```bash
+# Sửa nginx.conf: bỏ comment dòng least_conn; trong upstream block
+nano ~/nginx-practice/nginx.conf
+# → uncomment:  least_conn;
+
+# Test config trước khi reload
+docker exec nginx-practice nginx -t
+
+# Reload không downtime
+docker exec nginx-practice nginx -s reload
+
+START=$(date +%Y-%m-%dT%H:%M:%S)
+ab -n 300 -c 30 http://192.168.1.60/ 2>/dev/null
+
+docker logs --since "$START" nginx-practice \
+  | grep -oP 'upstream="\K[^"]+' \
+  | sort | uniq -c
+# least_conn: phân phối ít đều hơn về số lượng nhưng "thông minh" hơn khi 1 backend chậm
+```
+
+**Thí nghiệm 3: weight — backend không đồng đều**
+
+```bash
+# Sửa weight: .40 mạnh gấp đôi
+# server 192.168.1.40:80 weight=2;
+# server 192.168.1.41:80 weight=1;
+# server 192.168.1.42:80 weight=1;
+nano ~/nginx-practice/nginx.conf
+
+docker exec nginx-practice nginx -t && docker exec nginx-practice nginx -s reload
+
+START=$(date +%Y-%m-%dT%H:%M:%S)
+ab -n 400 -c 20 http://192.168.1.60/ 2>/dev/null
+
+docker logs --since "$START" nginx-practice \
+  | grep -oP 'upstream="\K[^"]+' \
+  | sort | uniq -c
+# Kỳ vọng: .40 ~200, .41 ~100, .42 ~100 (tỉ lệ 2:1:1)
+```
+
+**Thí nghiệm 4: Passive health check — tự loại backend chết**
+
+```bash
+# Đảm bảo max_fails=3 fail_timeout=30s đang có trong config
+
+# Mô phỏng backend .40 chết: tắt service trên Swarm node .40
+# (hoặc tắt port forwarding tạm thời để test)
+ssh bank@192.168.1.40 "sudo ufw deny 80/tcp"
+
+# Gửi request và observe:
+for i in $(seq 1 20); do
+    curl -s http://192.168.1.60/ -o /dev/null -w "%{http_code}\n"
+done
+
+# Xem log error — Nginx sẽ ghi lại khi .40 fail
+# error.log → /dev/stderr trong container; docker logs capture cả stderr
+docker logs --tail 20 nginx-practice 2>&1 | grep -i "failed\|upstream\|error"
+# → "connect() failed (111: Connection refused) while connecting to upstream"
+
+# Sau 3 fail: Nginx tự loại .40, chỉ dùng .41 và .42
+docker logs --tail 20 nginx-practice \
+  | grep -oP 'upstream="\K[^"]+'
+# Kỳ vọng: chỉ thấy .41 và .42
+
+# Bật lại .40
+ssh bank@192.168.1.40 "sudo ufw allow 80/tcp"
+# Sau 30s (fail_timeout), .40 được đưa trở lại pool tự động
+```
+
+---
+
+### NX.5 Advanced — Upload file lớn (client_max_body_size + Timeout)
+
+**Vấn đề thực tế Tech Lead gặp:**
+
+```
+Symptom                      | HTTP Error | Nguyên nhân
+──────────────────────────────|────────────|────────────────────────────────────────
+Upload file 10MB trả lỗi     | 413        | client_max_body_size mặc định 1m
+Upload mất quá lâu bị cắt    | 504        | proxy_send_timeout hoặc proxy_read_timeout
+Backend xử lý nặng bị timeout| 504        | proxy_read_timeout quá nhỏ
+Report xuất CSV mất 5 phút   | 504        | proxy_read_timeout < 300s
+API streaming bị đứt          | 502        | proxy_buffering on (cần off cho stream)
+```
+
+**Cấu hình xử lý upload lớn — thêm vào server block:**
+
+```bash
+cat > ~/nginx-practice/nginx.conf << 'EOF'
+worker_processes auto;
+events { worker_connections 1024; use epoll; multi_accept on; }
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    sendfile on; tcp_nopush on; tcp_nodelay on;
+    server_tokens off;
+
+    log_format detail '$remote_addr [$time_local] "$request" $status $body_bytes_sent upstream="$upstream_addr" upstream_rt=$upstream_response_time total_rt=$request_time';
+    access_log /var/log/nginx/access.log detail;
+    error_log  /var/log/nginx/error.log warn;
+
+    upstream swarm_backend {
+        least_conn;
+        server 192.168.1.40:80 weight=1 max_fails=3 fail_timeout=30s;
+        server 192.168.1.41:80 weight=1 max_fails=3 fail_timeout=30s;
+        server 192.168.1.42:80 weight=1 max_fails=3 fail_timeout=30s;
+        keepalive 32;
+    }
+
+    server {
+        listen 80;
+        server_name _;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # ─── UPLOAD LỚN ─────────────────────────────────────────────────
+        # Mặc định Nginx chỉ nhận body tối đa 1MB → upload file lớn bị 413
+        client_max_body_size 100m;
+
+        # Buffer body trong RAM trước khi gửi backend
+        # Nếu body > buffer → Nginx ghi tạm ra /tmp (chậm hơn)
+        client_body_buffer_size 1m;
+
+        # Thời gian chờ client gửi xong body (từng chunk, không phải toàn bộ)
+        # Tăng nếu client upload qua mạng chậm (mobile, 4G)
+        client_body_timeout 120s;
+
+        # ─── TIMEOUT BACKEND ────────────────────────────────────────────
+        proxy_connect_timeout 10s;    # TCP connect đến backend (hiếm khi cần tăng)
+        proxy_send_timeout    300s;   # gửi request body từ Nginx → backend
+        proxy_read_timeout    300s;   # chờ backend trả response ← quan trọng nhất
+
+        # proxy_request_buffering:
+        #   on (default) : Nginx buffer toàn bộ request body → gửi backend 1 lần
+        #                  Ổn với file < 100MB, không ổn với file cỡ GB
+        #   off           : Nginx stream trực tiếp client → backend, không cần buffer RAM
+        #                  Phù hợp upload lớn, backend phải hỗ trợ streaming
+        proxy_request_buffering off;
+
+        # ─── API thông thường ────────────────────────────────────────────
+        location /api/ {
+            proxy_pass         http://swarm_backend;
+            proxy_read_timeout 30s;   # API nhanh: fail nhanh nếu bất thường
+        }
+
+        # ─── Endpoint upload: override timeout riêng ─────────────────────
+        location /api/upload {
+            proxy_pass              http://swarm_backend;
+            client_max_body_size    500m;   # cho phép đến 500MB riêng endpoint này
+            proxy_read_timeout      600s;   # backend có thể mất đến 10 phút
+            proxy_send_timeout      600s;
+            proxy_request_buffering off;
+        }
+
+        # ─── API export/report nặng ──────────────────────────────────────
+        location /api/reports/ {
+            proxy_pass         http://swarm_backend;
+            proxy_read_timeout 600s;   # export lớn mất nhiều phút
+            proxy_send_timeout 600s;
+        }
+
+        # ─── Streaming / SSE / Long-poll ─────────────────────────────────
+        location /api/events {
+            proxy_pass              http://swarm_backend;
+            proxy_read_timeout      3600s;  # 1 giờ cho long-lived connection
+            proxy_buffering         off;    # stream ngay về client, không buffer
+            proxy_cache             off;
+        }
+
+        # ─── WebSocket proxy ─────────────────────────────────────────────
+        location /ws/ {
+            proxy_pass         http://swarm_backend;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade    $http_upgrade;  # protocol upgrade
+            proxy_set_header Connection "upgrade";
+            proxy_read_timeout 3600s;   # WebSocket cần timeout rất dài
+        }
+
+        location / {
+            proxy_pass http://swarm_backend;
+        }
+
+        location /nginx-health {
+            access_log off;
+            return 200 "healthy\n";
+            add_header Content-Type text/plain;
+        }
+    }
+
+    server {
+        listen 8080;
+        location /nginx-status {
+            stub_status on; access_log off;
+            allow 127.0.0.1;
+            allow 192.168.1.0/24; deny all;
+        }
+        location /nginx-health {
+            access_log off; return 200 "ok\n";
+            add_header Content-Type text/plain;
+        }
+    }
+}
+EOF
+
+docker exec nginx-practice nginx -t && docker exec nginx-practice nginx -s reload
+```
+
+**Test upload lớn:**
+
+```bash
+# Tạo file test 10MB
+dd if=/dev/urandom of=/tmp/test_10mb.bin bs=1M count=10
+dd if=/dev/urandom of=/tmp/test_50mb.bin bs=1M count=50
+
+# Upload (giả sử backend có endpoint nhận multipart)
+curl -X POST http://192.168.1.60/api/upload \
+  -F "file=@/tmp/test_10mb.bin" \
+  -v 2>&1 | grep "< HTTP"
+
+# Test với file vượt giới hạn — phải nhận 413
+dd if=/dev/urandom of=/tmp/test_600mb.bin bs=1M count=600
+curl -X POST http://192.168.1.60/api/upload \
+  -F "file=@/tmp/test_600mb.bin" \
+  -v 2>&1 | grep "< HTTP"
+# Kỳ vọng: HTTP/1.1 413 Request Entity Too Large
+
+# Đo thời gian upload
+time curl -X POST http://192.168.1.60/api/upload \
+  -F "file=@/tmp/test_50mb.bin" \
+  -o /dev/null -s -w "HTTP: %{http_code}, Time: %{time_total}s\n"
+```
+
+**Bảng quick-reference timeout — in ra để dán lên bàn làm việc:**
+
+```
+Directive                | Default | Khi nào cần tăng
+─────────────────────────|─────────|──────────────────────────────────────────
+client_max_body_size     | 1m      | Upload file > 1MB
+client_body_buffer_size  | 8k/16k  | Upload nhiều file trung bình
+client_body_timeout      | 60s     | Client upload qua mạng chậm (mobile)
+client_header_timeout    | 60s     | Hiếm khi cần
+proxy_connect_timeout    | 60s     | Backend cold start / khởi động chậm
+proxy_send_timeout       | 60s     | Forward upload lớn từ client → backend
+proxy_read_timeout       | 60s     | Backend xử lý lâu (report, AI, export)
+keepalive_timeout        | 75s     | Client gọi nhiều API liên tiếp
+send_timeout             | 60s     | Gửi response lớn về client chậm
+```
+
+---
+
+### NX.6 Advanced — Timeout Tuning cho API chậm
+
+**Giải thích chi tiết từng timeout và khi nào timeout xảy ra:**
+
+```
+[Client] ──────────────────────────────────────────── [Nginx] ──── [Backend]
+   │                                                    │               │
+   │ ← client_header_timeout: chờ client gửi header ──▶│               │
+   │ ← client_body_timeout: chờ mỗi chunk body ────────▶│               │
+   │                                                    │─ proxy_connect_timeout ─▶│
+   │                                                    │─ proxy_send_timeout ────▶│ (gửi request)
+   │                                                    │◀─ proxy_read_timeout ────│ (chờ response)
+   │◀─ send_timeout: gửi response về client ───────────│               │
+```
+
+```nginx
+http {
+    # Timeout mặc định cho toàn bộ server (áp dụng khi location không override)
+    proxy_connect_timeout 10s;
+    proxy_send_timeout    60s;
+    proxy_read_timeout    60s;
+
+    server {
+        listen 80;
+
+        # API thông thường: fail nhanh nếu bất thường
+        location /api/users {
+            proxy_pass         http://swarm_backend;
+            proxy_read_timeout 15s;   # query đơn giản — nếu > 15s là có vấn đề
+        }
+
+        # API tìm kiếm / filter phức tạp
+        location /api/search {
+            proxy_pass         http://swarm_backend;
+            proxy_read_timeout 60s;
+        }
+
+        # API export / báo cáo nặng
+        location /api/export {
+            proxy_pass         http://swarm_backend;
+            proxy_read_timeout 600s;   # export lớn mất nhiều phút
+            proxy_send_timeout 600s;
+            # Tắt buffer để gửi dần về client (không chờ backend xong hết)
+            proxy_buffering    off;
+        }
+
+        # API gọi external service (payment gateway, SMS, email)
+        location /api/payment {
+            proxy_pass         http://swarm_backend;
+            proxy_read_timeout 90s;    # external service có thể chậm
+            proxy_connect_timeout 15s; # tăng vì backend phải open connection đến external
+        }
+
+        # Realtime / SSE (Server-Sent Events)
+        location /api/notifications {
+            proxy_pass              http://swarm_backend;
+            proxy_read_timeout      3600s;  # 1 giờ — connection sống lâu
+            proxy_buffering         off;    # gửi event ngay khi có, không gom buffer
+            proxy_cache             off;
+            proxy_set_header        Connection "";
+            # Thêm header để client biết đây là SSE
+            add_header              Cache-Control no-cache;
+            add_header              X-Accel-Buffering no;  # disable buffering ở Nginx proxy
+        }
+
+        # WebSocket
+        location /ws/ {
+            proxy_pass         http://swarm_backend;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade    $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
+    }
+}
+```
+
+---
+
+### NX.7 Advanced — Rate Limiting (chặn DDoS cơ bản)
+
+**Use case:** Bảo vệ API login khỏi brute-force, giới hạn request per IP để chặn DDoS tầng ứng dụng.
+
+```nginx
+http {
+    # ─── Định nghĩa zone rate limit (đặt TRONG http { } NGOÀI server { }) ──────
+    #
+    # limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+    # │                │                  │            │     │
+    # │                │                  │            │     └─ tốc độ tối đa: 10 req/giây
+    # │                │                  │            └─ 10MB RAM cho zone
+    # │                │                  └─ tên zone
+    # │                └─ key = IP client dạng binary (compact hơn string)
+    # └─ directive
+    #
+    # 1MB RAM ≈ 16.000 IP → 10MB ≈ 160.000 IP khác nhau có thể track đồng thời
+
+    limit_req_zone $binary_remote_addr zone=api_limit:10m   rate=10r/s;  # API chung
+    limit_req_zone $binary_remote_addr zone=login_limit:10m rate=3r/m;   # Login: 3 lần/phút
+    limit_req_zone $binary_remote_addr zone=upload_limit:10m rate=2r/m;  # Upload: 2 lần/phút
+
+    # Zone cho limit_conn (giới hạn số connection đồng thời, khác với request)
+    limit_conn_zone $binary_remote_addr zone=per_ip:10m;
+
+    server {
+        listen 80;
+
+        # API chung: tối đa 10 req/s
+        # burst=20: cho phép "bùng" thêm 20 request vượt rate (queue hoặc xử lý ngay)
+        # nodelay: xử lý burst ngay thay vì delay queue → latency thấp hơn
+        # Không có nodelay: Nginx delay request trong burst → latency tăng theo rate
+        location /api/ {
+            limit_req        zone=api_limit burst=20 nodelay;
+            limit_req_status 429;   # trả 429 Too Many Requests (đúng hơn 503)
+
+            proxy_pass http://swarm_backend;
+        }
+
+        # Login endpoint: 3 lần/phút, burst 5
+        location /api/auth/login {
+            limit_req        zone=login_limit burst=5 nodelay;
+            limit_req_status 429;
+
+            # Giới hạn cả connection đồng thời: tối đa 5 connection từ 1 IP
+            limit_conn       per_ip 5;
+            limit_conn_status 429;
+
+            proxy_pass http://swarm_backend;
+        }
+
+        # Upload: rate limit thấp hơn API thường
+        location /api/upload {
+            limit_req        zone=upload_limit burst=2 nodelay;
+            limit_req_status 429;
+
+            client_max_body_size 200m;
+            proxy_read_timeout   300s;
+            proxy_pass           http://swarm_backend;
+        }
+
+        # Whitelist IP nội bộ: không áp dụng rate limit
+        location /api/internal/ {
+            allow  192.168.1.0/24;
+            deny   all;
+            proxy_pass http://swarm_backend;
+        }
+    }
+}
+```
+
+**Test rate limit:**
+
+```bash
+# Gửi 30 request liên tiếp nhanh → thấy 429 xuất hiện sau vài request
+for i in $(seq 1 30); do
+    curl -s -o /dev/null -w "[$i] %{http_code}\n" http://192.168.1.60/api/test
+done
+# Kỳ vọng: [1] 200, [2] 200, ..., [11] 429, [12] 429...
+
+# Test với ab — đếm 429
+ab -n 200 -c 20 http://192.168.1.60/api/test 2>&1 | grep -E "(Requests per|Non-2xx)"
+# Non-2xx responses: 180  ← số request bị rate limit (trả 429)
+
+# Verify log ghi lại rate limit event
+docker exec nginx-practice grep "limiting requests" /var/log/nginx/error.log | tail -5
+```
+
+---
+
+### NX.8 Advanced — Buffer Tuning
+
+**Hiểu proxy buffer ảnh hưởng performance:**
+
+```
+proxy_buffering ON (default):
+  Backend ──response──▶ [Nginx buffer trong RAM/disk] ──▶ Client
+  Backend giải phóng connection sớm hơn (backend không phải chờ client chậm)
+  Tốt cho: API response thông thường
+
+proxy_buffering OFF:
+  Backend ──response──▶ [Nginx pass-through] ──▶ Client  (không buffer)
+  Backend phải giữ connection đến khi client nhận xong
+  Tốt cho: Streaming, SSE, WebSocket, download file lớn
+```
+
+```nginx
+http {
+    server {
+        # ─── Buffer defaults (áp dụng cho tất cả location không override) ──
+        proxy_buffering on;
+
+        # Đọc response header từ backend (bao gồm cả response header của backend)
+        # 4k đủ cho header thông thường; tăng lên 8k nếu backend có nhiều header
+        proxy_buffer_size 8k;
+
+        # Bộ buffer đọc response body: 8 buffer × 32k = 256k RAM
+        # Nếu response > 256k → Nginx tràn ra temp file (chậm hơn RAM)
+        proxy_buffers 8 32k;
+
+        # Lượng buffer đang "busy" (đang ghi về client) được giữ đồng thời
+        # Phải ≤ tổng proxy_buffers
+        proxy_busy_buffers_size 64k;
+
+        # Mỗi lần ghi temp file trên disk (khi response vượt RAM buffer)
+        proxy_temp_file_write_size 64k;
+
+        # ─── API response thông thường (< 256k) ──────────────────────────
+        location /api/ {
+            proxy_pass http://swarm_backend;
+            # Dùng defaults ở trên, đủ cho hầu hết API
+        }
+
+        # ─── Export CSV / PDF lớn ─────────────────────────────────────────
+        location /api/export {
+            proxy_buffers              16 64k;   # 16 × 64k = 1MB RAM buffer
+            proxy_buffer_size          64k;
+            proxy_busy_buffers_size    128k;
+            proxy_temp_file_write_size 256k;
+            proxy_pass http://swarm_backend;
+        }
+
+        # ─── Streaming / download file: tắt buffer ───────────────────────
+        location /api/download {
+            proxy_buffering    off;   # stream thẳng về client
+            proxy_read_timeout 300s;
+            proxy_pass         http://swarm_backend;
+        }
+
+        # ─── SSE / Realtime events ────────────────────────────────────────
+        location /api/events {
+            proxy_buffering  off;    # BẮT BUỘC tắt cho SSE
+            proxy_cache      off;
+            proxy_read_timeout 3600s;
+            proxy_pass       http://swarm_backend;
+        }
+    }
+}
+```
+
+**Rule of thumb buffer:**
+
+```
+Response size    | Behavior                               | Action
+─────────────────|────────────────────────────────────────|──────────────────────────
+< 256k           | Toàn bộ trong RAM, nhanh               | Default buffer đủ dùng
+256k – 10MB      | Một phần ghi temp file, chậm hơn       | Tăng proxy_buffers
+> 10MB           | Nhiều I/O disk, overhead lớn            | proxy_buffering off
+Streaming / SSE  | Không buffering                         | proxy_buffering off (bắt buộc)
+```
+
+---
+
+### NX.9 Advanced — Gzip Compression
+
+**Use case:** Giảm băng thông 60-80% cho JSON response lớn, tăng tốc trải nghiệm người dùng.
+
+```nginx
+http {
+    # ─── Gzip settings ─────────────────────────────────────────────────
+    gzip on;
+
+    # Compress cả response từ proxied backend (default: off cho proxied)
+    gzip_proxied any;
+
+    # Mức nén: 1 (nhanh, ít nén) → 9 (chậm, nén nhiều)
+    # Level 4-6: sweet spot — giảm 60-70% size với CPU overhead chấp nhận được
+    gzip_comp_level 5;
+
+    # Không compress response < 1KB — overhead gzip header > lợi ích
+    gzip_min_length 1024;
+
+    # Gzip cả HTTP/1.0 proxied response
+    gzip_http_version 1.0;
+
+    # Loại content được compress — text/html mặc định, khai báo thêm:
+    gzip_types
+        text/plain
+        text/css
+        text/javascript
+        application/javascript
+        application/json
+        application/xml
+        application/xml+rss
+        image/svg+xml;
+
+    # Thêm Vary: Accept-Encoding vào response
+    # Giúp CDN và browser cache phân biệt compressed vs uncompressed version
+    gzip_vary on;
+
+    # Buffer cho quá trình nén (default 32×4k = 128k, đủ dùng)
+    gzip_buffers 32 4k;
+
+    server {
+        listen 80;
+        location / { proxy_pass http://swarm_backend; }
+        location /nginx-health { access_log off; return 200 "healthy\n"; add_header Content-Type text/plain; }
+    }
+    server {
+        listen 8080;
+        location /nginx-status { stub_status on; access_log off; allow 127.0.0.1; allow 192.168.1.0/24; deny all; }
+        location /nginx-health { access_log off; return 200 "ok\n"; add_header Content-Type text/plain; }
+    }
+}
+```
+
+**Test gzip hoạt động:**
+
+```bash
+# Gọi với Accept-Encoding: gzip
+curl -H "Accept-Encoding: gzip" -I http://192.168.1.60/api/users
+# Kỳ vọng trong header: Content-Encoding: gzip  + Vary: Accept-Encoding
+
+# So sánh kích thước có và không có gzip
+echo "=== Không gzip ==="
+curl -s http://192.168.1.60/api/users | wc -c
+
+echo "=== Có gzip (decompress tự động) ==="
+curl -s --compressed http://192.168.1.60/api/users | wc -c
+# Kỳ vọng: gzip nhỏ hơn 60-80% với JSON
+
+# Kiểm tra mức nén
+curl -s -H "Accept-Encoding: gzip" http://192.168.1.60/api/users -o /tmp/resp.gz
+wc -c /tmp/resp.gz   # kích thước compressed
+gzip -d /tmp/resp.gz && wc -c /tmp/resp    # kích thước sau decompress
+```
+
+---
+
+### NX.10 Advanced — Proxy Cache
+
+**Use case:** Cache response của API ít thay đổi (danh mục, config, static data) → giảm tải backend đáng kể.
+
+```nginx
+http {
+    # ─── Định nghĩa cache zone (NGOÀI server block) ─────────────────────
+    # /tmp/nginx-cache  : thư mục lưu file cache trên disk
+    # levels=1:2        : cấu trúc thư mục 2 cấp (a/bc/... tránh quá nhiều file trong 1 folder)
+    # keys_zone=c:10m   : tên zone "c", 10MB RAM lưu index (1MB ≈ 8000 key → 10MB ≈ 80000 key)
+    # max_size=1g       : tối đa 1GB disk lưu nội dung cache
+    # inactive=60m      : xóa cache không được access trong 60 phút
+    # use_temp_path=off : ghi thẳng vào cache dir (bỏ bước ghi tạm, ít I/O hơn)
+    proxy_cache_path /tmp/nginx-cache
+                     levels=1:2
+                     keys_zone=api_cache:10m
+                     max_size=1g
+                     inactive=60m
+                     use_temp_path=off;
+
+    server {
+        listen 80;
+
+        # Không cache mặc định (phải opt-in từng location)
+        proxy_cache off;
+
+        # ─── Cache danh mục, config ít thay đổi ─────────────────────────
+        location /api/categories {
+            proxy_pass  http://swarm_backend;
+            proxy_cache api_cache;
+
+            # Cache 200 OK trong 10 phút; cache 404 trong 1 phút
+            proxy_cache_valid 200 10m;
+            proxy_cache_valid 404  1m;
+
+            # Cache key = method + host + URI + query string
+            # Mặc định không include $args → ?page=1 và ?page=2 được cache chung!
+            proxy_cache_key "$request_method$host$request_uri$args";
+
+            # Nếu backend đang cập nhật (updating), dùng cache cũ thay vì trả lỗi
+            proxy_cache_use_stale error timeout updating
+                                  http_500 http_502 http_503 http_504;
+
+            # Lock: khi có nhiều request cùng lúc miss cache, chỉ 1 request đi backend
+            # Các request còn lại chờ cache được fill → tránh "cache stampede"
+            proxy_cache_lock on;
+
+            # Header debug — client thấy HIT/MISS/EXPIRED/BYPASS
+            add_header X-Cache-Status $upstream_cache_status;
+
+            proxy_pass http://swarm_backend;
+        }
+
+        # ─── KHÔNG cache: các request thay đổi data ─────────────────────
+        location /api/users/ {
+            proxy_cache off;
+            proxy_pass  http://swarm_backend;
+        }
+
+        # KHÔNG cache POST, PUT, DELETE (mặc định Nginx không cache nhưng nên explicit)
+        location /api/ {
+            proxy_cache off;
+            proxy_pass  http://swarm_backend;
+        }
+    }
+}
+```
+
+**Test cache hoạt động:**
+
+```bash
+# Lần 1: MISS (backend được gọi)
+curl -I http://192.168.1.60/api/categories
+# X-Cache-Status: MISS
+
+# Lần 2: HIT (từ cache Nginx, backend KHÔNG được gọi)
+curl -I http://192.168.1.60/api/categories
+# X-Cache-Status: HIT
+
+# Verify backend không nhận request thứ 2: xem access log backend
+# Không thấy request thứ 2 → cache đang hoạt động đúng
+
+# Xem file cache trên disk
+ls /tmp/nginx-cache/ -la
+
+# Force bypass cache (test / debug)
+curl -H "Cache-Control: no-cache" http://192.168.1.60/api/categories
+# X-Cache-Status: BYPASS
+
+# Xóa toàn bộ cache khi cần purge thủ công
+rm -rf /tmp/nginx-cache/*
+docker exec nginx-practice nginx -s reload
+```
+
+---
+
+### NX.11 Advanced — Security Headers + Connection Limits
+
+```nginx
+http {
+    # Zone giới hạn connection đồng thời
+    limit_conn_zone $binary_remote_addr zone=per_ip:10m;
+    limit_conn_zone $server_name        zone=per_server:10m;
+
+    server {
+        listen 80;
+
+        # ─── Security Headers ────────────────────────────────────────────
+        # Chặn clickjacking: không cho nhúng trang vào iframe ngoài domain
+        add_header X-Frame-Options "SAMEORIGIN" always;
+
+        # Ngăn browser đoán content-type (MIME sniffing attack)
+        add_header X-Content-Type-Options "nosniff" always;
+
+        # Referrer Policy: không gửi full URL khi điều hướng sang domain khác
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+        # Permissions Policy: tắt các tính năng browser không dùng
+        add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+
+        # ─── Giới hạn connection ─────────────────────────────────────────
+        # Tối đa 100 concurrent connection từ 1 IP
+        limit_conn per_ip 100;
+        # Tối đa 2000 concurrent connection đến toàn server
+        limit_conn per_server 2000;
+        limit_conn_status 429;
+
+        # ─── Chặn bad bots / scanner ─────────────────────────────────────
+        # 444 = Nginx đóng TCP ngay, không trả response gì (bảo tồn resource)
+        if ($http_user_agent = "") { return 444; }
+
+        if ($http_user_agent ~* (nmap|nikto|sqlmap|masscan|zgrab|dirbuster|hydra)) {
+            return 444;
+        }
+
+        # Chặn truy cập file nhạy cảm
+        location ~ /\.(env|git|htaccess|DS_Store) {
+            deny all;
+            return 404;
+        }
+
+        # Chặn path phổ biến của scanner (không có trong ứng dụng)
+        location ~* \.(php|asp|aspx|jsp|cgi)$ {
+            return 444;
+        }
+
+        # Admin panel: chỉ cho phép IP nội bộ
+        location /admin/ {
+            allow  192.168.1.0/24;
+            deny   all;
+            proxy_pass http://swarm_backend;
+        }
+
+        location / { proxy_pass http://swarm_backend; }
+        location /nginx-health { access_log off; return 200 "healthy\n"; add_header Content-Type text/plain; }
+    }
+
+    server {
+        listen 8080;
+        location /nginx-status { stub_status on; access_log off; allow 127.0.0.1; allow 192.168.1.0/24; deny all; }
+        location /nginx-health { access_log off; return 200 "ok\n"; add_header Content-Type text/plain; }
+    }
+}
+```
+
+---
+
+### NX.12 — Cheatsheet Tech Lead: Nginx Directives quan trọng
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 NGINX DIRECTIVES — TECH LEAD MUST KNOW                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  UPLOAD / BODY                                                               │
+│    client_max_body_size 100m      ← default 1m → upload > 1MB bị 413       │
+│    client_body_buffer_size 1m     ← RAM buffer body (default 8/16k)        │
+│    client_body_timeout 120s       ← chờ client gửi mỗi chunk body          │
+│    proxy_request_buffering off    ← stream upload, không cần buffer RAM     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  TIMEOUT (hay gặp nhất)                                                     │
+│    proxy_connect_timeout 10s      ← TCP connect đến backend                │
+│    proxy_send_timeout 300s        ← gửi request body tới backend           │
+│    proxy_read_timeout 300s        ← chờ RESPONSE từ backend ← quan trọng! │
+│    keepalive_timeout 65s          ← giữ keep-alive connection               │
+│    client_body_timeout 120s       ← client upload qua mạng chậm            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  LOAD BALANCING                                                              │
+│    round-robin (default)          ← request đều nhau, xử lý nhanh          │
+│    least_conn                     ← tốt nhất cho API xử lý không đồng đều  │
+│    ip_hash                        ← sticky session (cẩn thận scalability!)  │
+│    weight=N                       ← backend mạnh hơn nhận nhiều hơn        │
+│    max_fails=3 fail_timeout=30s   ← passive health check                   │
+│    keepalive 32                   ← persistent TCP connection → giảm RTT   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  RATE LIMITING                                                               │
+│    limit_req_zone $binary_remote_addr zone=z:10m rate=10r/s  ← khai báo   │
+│    limit_req zone=z burst=20 nodelay  ← áp dụng, burst không delay        │
+│    limit_conn_zone / limit_conn       ← giới hạn connection (≠ request)   │
+│    limit_req_status 429               ← trả 429, không 503                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  BUFFER (ảnh hưởng performance và memory)                                   │
+│    proxy_buffer_size 8k           ← đọc response header từ backend         │
+│    proxy_buffers 8 32k            ← đọc response body (8×32k = 256k RAM)  │
+│    proxy_busy_buffers_size 64k    ← đang gửi về client, giữ tối đa bao nhiêu│
+│    proxy_buffering off            ← bắt buộc cho streaming / SSE / WS      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  GZIP                                                                        │
+│    gzip on + gzip_proxied any     ← bật gzip kể cả response từ proxy       │
+│    gzip_comp_level 5              ← 1-9, sweet spot 4-6                     │
+│    gzip_min_length 1024           ← chỉ nén response > 1KB                 │
+│    gzip_types application/json... ← khai báo content type cần nén          │
+│    gzip_vary on                   ← Vary header cho CDN/browser cache       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  PROXY CACHE                                                                 │
+│    proxy_cache_path /tmp/c levels=1:2 keys_zone=c:10m max_size=1g         │
+│    proxy_cache api_cache          ← bật cache cho location                  │
+│    proxy_cache_valid 200 10m      ← cache 200 OK trong 10 phút             │
+│    proxy_cache_use_stale error timeout updating  ← dùng cache cũ khi lỗi  │
+│    proxy_cache_lock on            ← chống cache stampede                    │
+│    add_header X-Cache-Status $upstream_cache_status  ← debug HIT/MISS      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  SECURITY                                                                    │
+│    server_tokens off                  ← ẩn Nginx version                   │
+│    X-Frame-Options SAMEORIGIN        ← chặn clickjacking                   │
+│    X-Content-Type-Options nosniff    ← chặn MIME sniffing                  │
+│    return 444                         ← đóng TCP không trả response        │
+│    allow IP / deny all               ← whitelist IP                        │
+│    limit_conn per_ip 100             ← giới hạn connection đồng thời       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Debug commands thường dùng nhất:**
+
+```bash
+# Test config trước khi reload — LUÔN chạy bước này trước
+docker exec nginx-practice nginx -t
+
+# Reload không downtime (áp dụng config mới, không drop connection cũ)
+docker exec nginx-practice nginx -s reload
+
+# Dump full config đang dùng (bao gồm tất cả include)
+docker exec nginx-practice nginx -T
+
+# Theo dõi error log realtime
+docker exec nginx-practice tail -f /var/log/nginx/error.log
+
+# Xem phân phối request đến từng backend
+docker exec nginx-practice tail -100 /var/log/nginx/access.log \
+  | grep -oP 'upstream="\K[^"]+' | sort | uniq -c | sort -rn
+
+# Xem latency của từng backend
+docker exec nginx-practice tail -100 /var/log/nginx/access.log \
+  | awk '{print $8, $9}' | sort -k2 -n | tail -20
+# Cột 8: upstream_addr, cột 9: upstream_rt → backend nào chậm nhất
+
+# Connection stats realtime (curl bên trong container — tránh Docker NAT)
+watch -n 1 'docker exec nginx-practice curl -s http://localhost:8080/nginx-status'
+
+# Xem process nginx đang chạy bao nhiêu worker
+docker exec nginx-practice ps aux | grep "nginx: worker"
+```
+
+**Tình huống → Directive cần thêm/sửa ngay:**
+
+```
+Tình huống                            | Fix
+──────────────────────────────────────|──────────────────────────────────────────
+Upload file > 1MB bị 413             | client_max_body_size 100m+
+Upload qua mạng chậm bị timeout      | client_body_timeout 120s+
+API export/report 5 phút bị 504      | proxy_read_timeout 600s
+API streaming/SSE bị buffering       | proxy_buffering off
+WebSocket bị ngắt sau 60s            | proxy_read_timeout 3600s; Upgrade header
+Brute-force login                     | limit_req rate=3r/m burst=5 + limit_conn 5
+DDoS HTTP Layer 7 nhẹ                | limit_req rate=30r/s burst=50
+API JSON response lớn, bandwidth cao | gzip on; gzip_types application/json
+API danh mục gọi nhiều lần           | proxy_cache + proxy_cache_valid 200 10m
+Backend không đều (size request khác)| least_conn trong upstream block
+1 backend mạnh hơn                   | weight=2 cho backend mạnh hơn
+Scanner / bad bot                    | if ($http_user_agent ~* ...) return 444
+```
+
+---
+
+### Cập nhật bảng VM sau khi thêm 192.168.1.60
+
+| VM IP | Vai trò | Components |
+|---|---|---|
+| 192.168.1.36 | Virtual IP (Keepalived) | — |
+| 192.168.1.37 | Nginx Master (production) | Nginx, Keepalived, Node Exporter, Nginx Exporter, cAdvisor |
+| 192.168.1.43 | Nginx Backup (production) | Nginx, Keepalived |
+| **192.168.1.60** | **Nginx Practice (session này)** | **Nginx — thực hành, không Keepalived** |
+| 192.168.1.38 | DB Primary | SQL Server / PostgreSQL, Node Exporter |
+| 192.168.1.39 | DB Secondary | SQL Server / PostgreSQL, Node Exporter |
+| 192.168.1.40 | Swarm Manager | Docker, Node Exporter, cAdvisor |
+| 192.168.1.41 | Swarm Worker1 | Docker, Node Exporter, cAdvisor |
+| 192.168.1.42 | Swarm Worker2 | Docker, Node Exporter, cAdvisor |
+| 192.168.1.50 | Private Registry | Docker Registry / Harbor |
+| 192.168.1.51 | Monitoring | Prometheus, Grafana, InfluxDB |
+
+> **Lộ trình thực hành đề xuất:**
+> 1. ✅ Thực hành với VM .60 (session này) — làm quen Nginx load balancing + các directive nâng cao
+> 2. → Part 1 (VM .37) — Nginx production có monitoring + Nginx Exporter
+> 3. → Keepalived + VIP (VM .36/.37/.43) — HA setup sau khi đã nắm Nginx
